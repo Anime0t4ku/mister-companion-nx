@@ -7,6 +7,9 @@
 #include <cstring>
 #include <sstream>
 
+static const char* RemoteScriptPath = "/media/fat/Scripts/companion_remote.sh";
+static const char* RemoteScriptUrl = "https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/mister-companion/assets/companion_remote.sh";
+
 static std::vector<std::string> splitWords(const std::string& value) {
     std::stringstream stream(value);
     std::vector<std::string> parts;
@@ -25,6 +28,14 @@ static std::string safeText(const std::string& value, const std::string& fallbac
     return value.empty() ? fallback : value;
 }
 
+static bool contains(const std::string& value, const std::string& needle) {
+    return value.find(needle) != std::string::npos;
+}
+
+static std::string remoteManageCommand(const std::string& action) {
+    return std::string(RemoteScriptPath) + " " + action + " --unattended";
+}
+
 void App::run() {
     config = ConfigStore::load();
     if (!ui.initialize()) return;
@@ -34,14 +45,24 @@ void App::run() {
 
     while (appletMainLoop()) {
         padUpdate(&pad);
-        const u64 buttons = padGetButtonsDown(&pad);
+        const u64 down = padGetButtonsDown(&pad);
+        const u64 up = padGetButtonsUp(&pad);
+        const u64 held = padGetButtons(&pad);
 
-        if (buttons & HidNpadButton_Plus) break;
+        if (passthroughActive) {
+            handlePassthroughInput(down, up, held);
+            draw();
+            continue;
+        }
 
-        handleInput(buttons);
+        if (down & HidNpadButton_Plus) break;
+
+        handleInput(down);
         draw();
     }
 
+    if (passthroughActive) stopPassthrough();
+    remote.disconnect();
     ui.shutdown();
 }
 
@@ -53,16 +74,25 @@ void App::drawHeader() {
     ui.drawText(42, 30, "MISTER COMPANION NX", UiRenderer::rgb(248, 245, 255), 3);
     ui.drawStatusPill(UiRenderer::Width - 280, 28, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected());
 
-    ui.drawTab(40, 110, 260, "CONNECTION", tab == Tab::Connection);
-    ui.drawTab(320, 110, 220, "DEVICE", tab == Tab::Device);
+    ui.drawTab(40, 110, 240, "CONNECTION", tab == Tab::Connection);
+    ui.drawTab(300, 110, 200, "DEVICE", tab == Tab::Device);
+    ui.drawTab(520, 110, 200, "REMOTE", tab == Tab::Remote);
 }
 
 void App::draw() {
     ui.beginFrame();
+
+    if (passthroughActive) {
+        drawPassthrough();
+        ui.endFrame();
+        return;
+    }
+
     drawHeader();
 
     if (tab == Tab::Connection) drawConnection();
-    else drawDevice();
+    else if (tab == Tab::Device) drawDevice();
+    else drawRemote();
 
     ui.drawMessage(lastMessage);
     ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R SWITCH TAB    + EXIT");
@@ -76,7 +106,7 @@ void App::drawConnection() {
     ui.drawButton(76, 252, 508, 60, "HOST  " + safeText(config.host), selected == 0);
     ui.drawButton(76, 334, 508, 60, "USER  " + safeText(config.username), selected == 1);
     ui.drawButton(76, 416, 508, 60, config.password.empty() ? "PASSWORD  NOT SET" : "PASSWORD  ********", selected == 2);
-    ui.drawButton(76, 498, 508, 60, ssh.isConnected() ? "DISCONNECT" : "CONNECT OVER SSH", selected == 3);
+    ui.drawButton(76, 498, 508, 60, ssh.isConnected() ? "DISCONNECT" : "CONNECT", selected == 3);
 
     ui.drawText(696, 254, "CONNECTION STATUS", UiRenderer::rgb(174, 154, 218), 2);
     ui.drawText(696, 296, status, UiRenderer::rgb(248, 245, 255), 3);
@@ -115,20 +145,89 @@ void App::drawDevice() {
     ui.drawButton(696, 498, 508, 60, "REBOOT MISTER", selected == 3, true);
 }
 
+void App::drawRemote() {
+    ui.drawCard(40, 176, 580, 400, "REMOTE STATUS");
+    ui.drawCard(660, 176, 580, 400, "REMOTE ACTIONS");
+
+    ui.drawText(76, 246, "MISTER", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(260, 246, safeText(config.host), UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 294, "DAEMON", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(260, 294, remoteInstalled, UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 342, "STATUS", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(260, 342, remoteRunning == "Yes" ? "RUNNING" : remoteRunning == "No" ? "STOPPED" : remoteRunning, remoteRunning == "Yes" ? UiRenderer::rgb(112, 232, 165) : UiRenderer::rgb(232, 130, 160), 2);
+
+    ui.drawText(76, 390, "START ON BOOT", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(260, 390, remoteStartup, UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 438, "PASSTHROUGH", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(260, 438, passthroughActive ? "ENABLED" : "DISABLED", passthroughActive ? UiRenderer::rgb(112, 232, 165) : UiRenderer::rgb(218, 208, 238), 2);
+
+    ui.drawText(76, 506, "PASSTHROUGH EXIT", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(76, 538, "PRESS L3 AND R3 TOGETHER", UiRenderer::rgb(248, 245, 255), 2);
+
+    const bool installed = remoteInstalled == "Yes";
+    const bool running = remoteRunning == "Yes";
+    const bool startup = remoteStartup == "Enabled";
+
+    if (!installed) {
+        ui.drawButton(696, 280, 508, 60, "INSTALL / UPDATE DAEMON", selected == 0);
+        ui.drawButton(696, 362, 508, 60, "REFRESH REMOTE STATUS", selected == 1);
+        return;
+    }
+
+    if (running) {
+        ui.drawButton(696, 238, 508, 60, "START PASSTHROUGH MODE", selected == 0);
+        ui.drawButton(696, 320, 508, 60, "STOP REMOTE DAEMON", selected == 1);
+        ui.drawButton(696, 402, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 2);
+        ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3);
+        return;
+    }
+
+    ui.drawButton(696, 238, 508, 60, "START REMOTE DAEMON", selected == 0);
+    ui.drawButton(696, 320, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 1);
+    ui.drawButton(696, 402, 508, 60, "UNINSTALL REMOTE DAEMON", selected == 2, true);
+    ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3);
+}
+
+void App::drawPassthrough() {
+    ui.clear(UiRenderer::rgb(12, 10, 20));
+    ui.fillRect(0, 0, UiRenderer::Width, UiRenderer::Height, UiRenderer::rgb(12, 10, 20));
+    ui.fillRect(0, 0, UiRenderer::Width, 96, UiRenderer::rgb(20, 16, 34));
+    ui.fillRect(0, 94, UiRenderer::Width, 4, UiRenderer::rgb(143, 84, 255));
+
+    ui.drawText(42, 32, "REMOTE PASSTHROUGH ACTIVE", UiRenderer::rgb(248, 245, 255), 3);
+    ui.drawStatusPill(UiRenderer::Width - 280, 28, remote.isConnected() ? "REMOTE READY" : "REMOTE LOST", remote.isConnected());
+
+    ui.drawCard(220, 180, 840, 340, "SWITCH CONTROLS ARE FORWARDED TO MISTER");
+    ui.drawText(280, 285, "USE THE SWITCH PHYSICAL BUTTONS TO CONTROL MISTER", UiRenderer::rgb(248, 245, 255), 2);
+    ui.drawText(280, 345, "PRESS BOTH ANALOG STICKS AT THE SAME TIME", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(280, 390, "L3 + R3 EXITS PASSTHROUGH MODE", UiRenderer::rgb(248, 245, 255), 3);
+
+    ui.drawFooter("PASSTHROUGH MODE    L3 + R3 EXIT    RELEASE ALL ON EXIT");
+}
+
 void App::handleInput(u64 buttons) {
     if (buttons & HidNpadButton_L) {
-        tab = Tab::Connection;
+        if (tab == Tab::Connection) tab = Tab::Remote;
+        else if (tab == Tab::Device) tab = Tab::Connection;
+        else tab = Tab::Device;
         selected = 0;
         return;
     }
     if (buttons & HidNpadButton_R) {
-        tab = Tab::Device;
+        if (tab == Tab::Connection) tab = Tab::Device;
+        else if (tab == Tab::Device) tab = Tab::Remote;
+        else tab = Tab::Connection;
         selected = 0;
+        if (tab == Tab::Remote && remoteInstalled == "Not checked") refreshRemoteStatus();
         return;
     }
 
     if (tab == Tab::Connection) handleConnectionInput(buttons);
-    else handleDeviceInput(buttons);
+    else if (tab == Tab::Device) handleDeviceInput(buttons);
+    else handleRemoteInput(buttons);
 }
 
 void App::handleConnectionInput(u64 buttons) {
@@ -154,6 +253,90 @@ void App::handleDeviceInput(u64 buttons) {
         case 1: toggleSmb(); break;
         case 2: returnToMenu(); break;
         case 3: reboot(); break;
+    }
+}
+
+void App::handleRemoteInput(u64 buttons) {
+    const bool installed = remoteInstalled == "Yes";
+    const bool running = remoteRunning == "Yes";
+    const int actionCount = installed ? 4 : 2;
+
+    if (buttons & HidNpadButton_Up) selected = (selected + actionCount - 1) % actionCount;
+    if (buttons & HidNpadButton_Down) selected = (selected + 1) % actionCount;
+    if (!(buttons & HidNpadButton_A)) return;
+
+    if (!installed) {
+        switch (selected) {
+            case 0: installRemoteDaemon(); break;
+            case 1: refreshRemoteStatus(); break;
+        }
+        return;
+    }
+
+    if (running) {
+        switch (selected) {
+            case 0: startPassthrough(); break;
+            case 1: stopRemoteDaemon(); break;
+            case 2: toggleRemoteStartup(); break;
+            case 3: refreshRemoteStatus(); break;
+        }
+        return;
+    }
+
+    switch (selected) {
+        case 0: startRemoteDaemon(); break;
+        case 1: toggleRemoteStartup(); break;
+        case 2: uninstallRemoteDaemon(); break;
+        case 3: refreshRemoteStatus(); break;
+    }
+}
+
+void App::handlePassthroughInput(u64 down, u64 up, u64 held) {
+    if ((held & HidNpadButton_StickL) && (held & HidNpadButton_StickR)) {
+        stopPassthrough();
+        return;
+    }
+
+    sendPassthroughButton(HidNpadButton_Up, down, "dpad", "up", "down");
+    sendPassthroughButton(HidNpadButton_Down, down, "dpad", "down", "down");
+    sendPassthroughButton(HidNpadButton_Left, down, "dpad", "left", "down");
+    sendPassthroughButton(HidNpadButton_Right, down, "dpad", "right", "down");
+
+    sendPassthroughButton(HidNpadButton_Up, up, "dpad", "up", "up");
+    sendPassthroughButton(HidNpadButton_Down, up, "dpad", "down", "up");
+    sendPassthroughButton(HidNpadButton_Left, up, "dpad", "left", "up");
+    sendPassthroughButton(HidNpadButton_Right, up, "dpad", "right", "up");
+
+    sendPassthroughButton(HidNpadButton_A, down, "button", "b", "down");
+    sendPassthroughButton(HidNpadButton_B, down, "button", "a", "down");
+    sendPassthroughButton(HidNpadButton_X, down, "button", "y", "down");
+    sendPassthroughButton(HidNpadButton_Y, down, "button", "x", "down");
+    sendPassthroughButton(HidNpadButton_L, down, "button", "l", "down");
+    sendPassthroughButton(HidNpadButton_R, down, "button", "r", "down");
+    sendPassthroughButton(HidNpadButton_ZL, down, "button", "zl", "down");
+    sendPassthroughButton(HidNpadButton_ZR, down, "button", "zr", "down");
+    sendPassthroughButton(HidNpadButton_Minus, down, "button", "select", "down");
+    sendPassthroughButton(HidNpadButton_Plus, down, "button", "start", "down");
+
+    sendPassthroughButton(HidNpadButton_A, up, "button", "b", "up");
+    sendPassthroughButton(HidNpadButton_B, up, "button", "a", "up");
+    sendPassthroughButton(HidNpadButton_X, up, "button", "y", "up");
+    sendPassthroughButton(HidNpadButton_Y, up, "button", "x", "up");
+    sendPassthroughButton(HidNpadButton_L, up, "button", "l", "up");
+    sendPassthroughButton(HidNpadButton_R, up, "button", "r", "up");
+    sendPassthroughButton(HidNpadButton_ZL, up, "button", "zl", "up");
+    sendPassthroughButton(HidNpadButton_ZR, up, "button", "zr", "up");
+    sendPassthroughButton(HidNpadButton_Minus, up, "button", "select", "up");
+    sendPassthroughButton(HidNpadButton_Plus, up, "button", "start", "up");
+}
+
+void App::sendPassthroughButton(u64 mask, u64 buttons, const std::string& control, const std::string& name, const std::string& action) {
+    if (!passthroughActive) return;
+    if (!(buttons & mask)) return;
+    std::string message;
+    if (!remote.sendController(control, name, action, message)) {
+        passthroughActive = false;
+        lastMessage = message;
     }
 }
 
@@ -185,6 +368,8 @@ void App::editText(const char* title, std::string& value, bool password) {
 
 bool App::confirm(const char* title, const char* body) {
     int choice = 1;
+    bool inputReleased = false;
+
     PadState pad;
     padInitializeDefault(&pad);
 
@@ -200,7 +385,15 @@ bool App::confirm(const char* title, const char* body) {
         ui.endFrame();
 
         padUpdate(&pad);
-        u64 buttons = padGetButtonsDown(&pad);
+        const u64 held = padGetButtons(&pad);
+        const u64 buttons = padGetButtonsDown(&pad);
+
+        if (!inputReleased) {
+            const u64 confirmButtons = HidNpadButton_A | HidNpadButton_B | HidNpadButton_Left | HidNpadButton_Right;
+            if ((held & confirmButtons) == 0) inputReleased = true;
+            continue;
+        }
+
         if (buttons & HidNpadButton_Left) choice = 0;
         if (buttons & HidNpadButton_Right) choice = 1;
         if (buttons & HidNpadButton_A) return choice == 0;
@@ -240,7 +433,7 @@ void App::connectOrDisconnect() {
 }
 
 std::string App::runCommandMessage(const std::string& command) {
-    if (!ssh.isConnected()) return "No active SSH connection.";
+    if (!ssh.isConnected()) return "No active MiSTer connection.";
     SshResult result = ssh.runCommand(command);
     if (result.success) return result.output.empty() ? "Command completed." : result.output;
     return result.error.empty() ? "Command failed." : result.error;
@@ -248,7 +441,7 @@ std::string App::runCommandMessage(const std::string& command) {
 
 void App::refreshDevice() {
     if (!ssh.isConnected()) {
-        lastMessage = "No active SSH connection.";
+        lastMessage = "No active MiSTer connection.";
         return;
     }
     refreshStorage();
@@ -297,7 +490,7 @@ void App::refreshNowPlaying() {
 
 void App::toggleSmb() {
     if (!ssh.isConnected()) {
-        lastMessage = "No active SSH connection.";
+        lastMessage = "No active MiSTer connection.";
         return;
     }
 
@@ -323,7 +516,7 @@ void App::returnToMenu() {
 
 void App::reboot() {
     if (!ssh.isConnected()) {
-        lastMessage = "No active SSH connection.";
+        lastMessage = "No active MiSTer connection.";
         return;
     }
     if (!confirm("CONFIRM REBOOT", "ARE YOU SURE YOU WANT TO REBOOT THE MISTER?")) return;
@@ -336,6 +529,107 @@ void App::reboot() {
     smbStatus = "Rebooting...";
     nowPlaying.clear();
     lastMessage = result.success ? "Reboot command sent." : "Reboot command may have failed.";
+}
+
+void App::refreshRemoteStatus() {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+
+    const std::string command =
+        "if [ -x /media/fat/Scripts/companion_remote.sh ]; then "
+        "/media/fat/Scripts/companion_remote.sh status --unattended; "
+        "else "
+        "echo SCRIPT_INSTALLED=0; "
+        "echo DAEMON_INSTALLED=0; "
+        "echo DAEMON_RUNNING=0; "
+        "echo PORT_LISTENING=0; "
+        "echo START_ON_BOOT=0; "
+        "fi";
+
+    SshResult result = ssh.runCommand(command);
+    if (!result.success) {
+        lastMessage = result.error.empty() ? "Unable to read remote status." : result.error;
+        return;
+    }
+
+    remoteInstalled = contains(result.output, "DAEMON_INSTALLED=1") || contains(result.output, "SCRIPT_INSTALLED=1") ? "Yes" : "No";
+    remoteRunning = contains(result.output, "DAEMON_RUNNING=1") || contains(result.output, "PORT_LISTENING=1") ? "Yes" : "No";
+    remoteStartup = contains(result.output, "START_ON_BOOT=1") ? "Enabled" : "Disabled";
+    lastMessage = "Remote status refreshed.";
+}
+
+void App::installRemoteDaemon() {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+
+    const std::string command =
+        "mkdir -p /media/fat/Scripts && "
+        "(command -v curl >/dev/null 2>&1 && curl -L -o " + std::string(RemoteScriptPath) + " " + RemoteScriptUrl + " || "
+        "command -v wget >/dev/null 2>&1 && wget -O " + std::string(RemoteScriptPath) + " " + RemoteScriptUrl + ") && "
+        "chmod +x " + std::string(RemoteScriptPath) + " && " +
+        remoteManageCommand("install");
+
+    lastMessage = runCommandMessage(command);
+    refreshRemoteStatus();
+}
+
+void App::startRemoteDaemon() {
+    lastMessage = runCommandMessage(remoteManageCommand("start"));
+    refreshRemoteStatus();
+}
+
+void App::stopRemoteDaemon() {
+    std::string message;
+    if (remote.isConnected()) remote.releaseAll(message);
+    remote.disconnect();
+    lastMessage = runCommandMessage(remoteManageCommand("stop"));
+    refreshRemoteStatus();
+}
+
+void App::toggleRemoteStartup() {
+    const bool enabled = remoteStartup == "Enabled";
+    lastMessage = runCommandMessage(remoteManageCommand(enabled ? "disable-boot" : "enable-boot"));
+    refreshRemoteStatus();
+}
+
+void App::uninstallRemoteDaemon() {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+    if (!confirm("UNINSTALL REMOTE", "REMOVE THE COMPANION REMOTE DAEMON?")) return;
+
+    std::string message;
+    if (remote.isConnected()) remote.releaseAll(message);
+    remote.disconnect();
+    lastMessage = runCommandMessage(remoteManageCommand("uninstall"));
+    refreshRemoteStatus();
+}
+
+
+void App::startPassthrough() {
+    std::string message;
+    if (!remote.isConnected()) {
+        if (!remote.connect(config.host, message)) {
+                lastMessage = message;
+            return;
+        }
+    }
+
+    passthroughActive = true;
+    lastMessage.clear();
+}
+
+void App::stopPassthrough() {
+    std::string message;
+    if (remote.isConnected()) remote.releaseAll(message);
+    remote.disconnect();
+    passthroughActive = false;
+    lastMessage = "Passthrough stopped. All inputs released.";
 }
 
 std::string App::formatDfLine(const std::string& line) {

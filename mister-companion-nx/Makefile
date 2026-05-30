@@ -7,7 +7,7 @@ ROMFS       := romfs
 
 APP_TITLE   := MiSTer Companion NX
 APP_AUTHOR  := Anime0t4ku
-APP_VERSION := 0.2.0
+APP_VERSION := 0.3.0
 ICON        := icon.jpg
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
