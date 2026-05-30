@@ -182,3 +182,75 @@ SshResult SshClient::runCommand(const std::string& command) {
 
     return result;
 }
+
+SshResult SshClient::runCommandStreaming(const std::string& command, const std::function<void(const std::string&)>& onOutput) {
+    SshResult result;
+
+    if (!isConnected()) {
+        result.error = "No active SSH connection.";
+        return result;
+    }
+
+    LIBSSH2_SESSION* sshSession = static_cast<LIBSSH2_SESSION*>(session);
+    LIBSSH2_CHANNEL* channel = libssh2_channel_open_session(sshSession);
+    if (!channel) {
+        result.error = "Unable to open SSH channel.";
+        disconnect();
+        return result;
+    }
+
+    int rc = libssh2_channel_exec(channel, command.c_str());
+    if (rc != 0) {
+        result.error = "Unable to execute SSH command.";
+        libssh2_channel_free(channel);
+        return result;
+    }
+
+    char buffer[1024];
+    for (;;) {
+        ssize_t bytes = libssh2_channel_read(channel, buffer, sizeof(buffer));
+        if (bytes > 0) {
+            std::string chunk(buffer, buffer + bytes);
+            result.output += chunk;
+            if (onOutput) onOutput(chunk);
+            continue;
+        }
+        if (bytes == LIBSSH2_ERROR_EAGAIN) continue;
+        break;
+    }
+
+    std::string stderrText;
+    for (;;) {
+        ssize_t bytes = libssh2_channel_read_stderr(channel, buffer, sizeof(buffer));
+        if (bytes > 0) {
+            std::string chunk(buffer, buffer + bytes);
+            stderrText += chunk;
+            if (onOutput) onOutput(chunk);
+            continue;
+        }
+        if (bytes == LIBSSH2_ERROR_EAGAIN) continue;
+        break;
+    }
+
+    libssh2_channel_send_eof(channel);
+    libssh2_channel_wait_eof(channel);
+    libssh2_channel_wait_closed(channel);
+
+    int exitCode = libssh2_channel_get_exit_status(channel);
+    libssh2_channel_free(channel);
+
+    while (!result.output.empty() && (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    while (!stderrText.empty() && (stderrText.back() == '\n' || stderrText.back() == '\r')) {
+        stderrText.pop_back();
+    }
+
+    result.success = exitCode == 0;
+    result.error = stderrText;
+    if (!result.success && result.error.empty()) {
+        result.error = "Command exited with code " + std::to_string(exitCode) + ".";
+    }
+
+    return result;
+}

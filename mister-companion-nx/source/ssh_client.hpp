@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 
+#include <functional>
 #include <string>
 
 struct SshResult {
@@ -19,6 +20,7 @@ public:
     void disconnect();
     bool isConnected() const;
     SshResult runCommand(const std::string& command);
+    SshResult runCommandStreaming(const std::string& command, const std::function<void(const std::string&)>& onOutput);
 
 private:
     int socketFd = -1;
