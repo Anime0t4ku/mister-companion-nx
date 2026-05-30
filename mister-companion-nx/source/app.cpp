@@ -21,8 +21,13 @@ static std::string trim(std::string value) {
     return value;
 }
 
+static std::string safeText(const std::string& value, const std::string& fallback = "Not set") {
+    return value.empty() ? fallback : value;
+}
+
 void App::run() {
     config = ConfigStore::load();
+    if (!ui.initialize()) return;
 
     PadState pad;
     padInitializeDefault(&pad);
@@ -35,62 +40,79 @@ void App::run() {
 
         handleInput(buttons);
         draw();
-        consoleUpdate(NULL);
     }
+
+    ui.shutdown();
+}
+
+void App::drawHeader() {
+    ui.clear(UiRenderer::rgb(12, 10, 20));
+    ui.fillRect(0, 0, UiRenderer::Width, 92, UiRenderer::rgb(20, 16, 34));
+    ui.fillRect(0, 90, UiRenderer::Width, 4, UiRenderer::rgb(143, 84, 255));
+
+    ui.drawText(42, 30, "MISTER COMPANION NX", UiRenderer::rgb(248, 245, 255), 3);
+    ui.drawStatusPill(UiRenderer::Width - 280, 28, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected());
+
+    ui.drawTab(40, 110, 260, "CONNECTION", tab == Tab::Connection);
+    ui.drawTab(320, 110, 220, "DEVICE", tab == Tab::Device);
 }
 
 void App::draw() {
-    printf("\x1b[2J\x1b[H");
-    printf("MiSTer Companion NX\n");
-    printf("===================\n\n");
-    printf("[%s Connection]  [%s Device]\n\n", tab == Tab::Connection ? "*" : " ", tab == Tab::Device ? "*" : " ");
+    ui.beginFrame();
+    drawHeader();
 
     if (tab == Tab::Connection) drawConnection();
     else drawDevice();
 
-    drawFooter();
+    ui.drawMessage(lastMessage);
+    ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R SWITCH TAB    + EXIT");
+    ui.endFrame();
 }
 
 void App::drawConnection() {
-    const char* marker[] = {">", " ", " ", " ", " ", " ", " "};
-    for (int i = 0; i < 7; i++) marker[i] = selected == i ? ">" : " ";
+    ui.drawCard(40, 176, 580, 400, "CONNECTION");
+    ui.drawCard(660, 176, 580, 400, "STATUS");
 
-    printf("Connection\n");
-    printf("----------\n");
-    printf("%s Name:     %s\n", marker[0], config.name.c_str());
-    printf("%s IP/Host:  %s\n", marker[1], config.host.empty() ? "Not set" : config.host.c_str());
-    printf("%s Username: %s\n", marker[2], config.username.c_str());
-    printf("%s Password: %s\n", marker[3], config.password.empty() ? "Not set" : "********");
-    printf("%s Save profile\n", marker[4]);
-    printf("%s %s\n", marker[5], ssh.isConnected() ? "Disconnect" : "Connect over SSH");
-    printf("%s Test command: echo connected\n\n", marker[6]);
-    printf("Status: %s\n", status.c_str());
-    if (!lastMessage.empty()) printf("Message: %s\n", lastMessage.c_str());
+    ui.drawButton(76, 252, 508, 60, "HOST  " + safeText(config.host), selected == 0);
+    ui.drawButton(76, 334, 508, 60, "USER  " + safeText(config.username), selected == 1);
+    ui.drawButton(76, 416, 508, 60, config.password.empty() ? "PASSWORD  NOT SET" : "PASSWORD  ********", selected == 2);
+    ui.drawButton(76, 498, 508, 60, ssh.isConnected() ? "DISCONNECT" : "CONNECT OVER SSH", selected == 3);
+
+    ui.drawText(696, 254, "CONNECTION STATUS", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(696, 296, status, UiRenderer::rgb(248, 245, 255), 3);
+
+    ui.drawText(696, 380, "TIP", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(696, 420, "USE ROOT / 1 FOR DEFAULT MISTER SSH", UiRenderer::rgb(218, 208, 238), 2);
 }
 
 void App::drawDevice() {
-    const char* marker[] = {">", " ", " ", " ", " "};
-    for (int i = 0; i < 5; i++) marker[i] = selected == i ? ">" : " ";
+    ui.drawCard(40, 176, 580, 400, "DEVICE STATUS");
+    ui.drawCard(660, 176, 580, 400, "DEVICE ACTIONS");
 
-    printf("Device\n");
-    printf("------\n");
-    printf("MiSTer: %s\n", config.host.empty() ? "Not set" : config.host.c_str());
-    printf("Status: %s\n\n", ssh.isConnected() ? "Connected" : "Disconnected");
-    printf("SD:  %s\n", sdStorage.c_str());
-    printf("USB: %s\n", usbStorage.c_str());
-    printf("SMB: %s\n", smbStatus.c_str());
-    if (!nowPlaying.empty()) printf("Now Playing: %s\n", nowPlaying.c_str());
-    printf("\n");
-    printf("%s Refresh device info\n", marker[0]);
-    printf("%s Toggle SMB startup\n", marker[1]);
-    printf("%s Return to MiSTer menu\n", marker[2]);
-    printf("%s Reboot MiSTer\n", marker[3]);
-    printf("%s Disconnect\n\n", marker[4]);
-    if (!lastMessage.empty()) printf("Message: %s\n", lastMessage.c_str());
-}
+    ui.drawText(76, 246, "MISTER", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 246, safeText(config.host), UiRenderer::rgb(248, 245, 255), 2);
 
-void App::drawFooter() {
-    printf("\nControls: Up/Down Select  A Confirm/Edit  L/R Switch Tab  + Exit\n");
+    ui.drawText(76, 294, "STATUS", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 294, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected() ? UiRenderer::rgb(112, 232, 165) : UiRenderer::rgb(232, 130, 160), 2);
+
+    ui.drawText(76, 342, "SD", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 342, sdStorage, UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 390, "USB", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 390, usbStorage, UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 438, "SMB", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 438, smbStatus, UiRenderer::rgb(248, 245, 255), 2);
+
+    if (!nowPlaying.empty()) {
+        ui.drawText(76, 500, "NOW PLAYING", UiRenderer::rgb(174, 154, 218), 2);
+        ui.drawText(76, 532, nowPlaying, UiRenderer::rgb(248, 245, 255), 2);
+    }
+
+    ui.drawButton(696, 252, 508, 60, "REFRESH DEVICE INFO", selected == 0);
+    ui.drawButton(696, 334, 508, 60, "TOGGLE SMB STARTUP", selected == 1);
+    ui.drawButton(696, 416, 508, 60, "RETURN TO MISTER MENU", selected == 2);
+    ui.drawButton(696, 498, 508, 60, "REBOOT MISTER", selected == 3, true);
 }
 
 void App::handleInput(u64 buttons) {
@@ -110,24 +132,21 @@ void App::handleInput(u64 buttons) {
 }
 
 void App::handleConnectionInput(u64 buttons) {
-    if (buttons & HidNpadButton_Up) selected = (selected + 6) % 7;
-    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 7;
+    if (buttons & HidNpadButton_Up) selected = (selected + 3) % 4;
+    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 4;
     if (!(buttons & HidNpadButton_A)) return;
 
     switch (selected) {
-        case 0: editText("Device name", config.name); break;
-        case 1: editText("MiSTer IP or hostname", config.host); break;
-        case 2: editText("SSH username", config.username); break;
-        case 3: editText("SSH password", config.password, true); break;
-        case 4: saveConfig(); break;
-        case 5: connectOrDisconnect(); break;
-        case 6: lastMessage = runCommandMessage("echo connected"); break;
+        case 0: editText("MiSTer IP or hostname", config.host); break;
+        case 1: editText("SSH username", config.username); break;
+        case 2: editText("SSH password", config.password, true); break;
+        case 3: connectOrDisconnect(); break;
     }
 }
 
 void App::handleDeviceInput(u64 buttons) {
-    if (buttons & HidNpadButton_Up) selected = (selected + 4) % 5;
-    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 5;
+    if (buttons & HidNpadButton_Up) selected = (selected + 3) % 4;
+    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 4;
     if (!(buttons & HidNpadButton_A)) return;
 
     switch (selected) {
@@ -135,11 +154,6 @@ void App::handleDeviceInput(u64 buttons) {
         case 1: toggleSmb(); break;
         case 2: returnToMenu(); break;
         case 3: reboot(); break;
-        case 4:
-            ssh.disconnect();
-            status = "Disconnected";
-            lastMessage = "Disconnected.";
-            break;
     }
 }
 
@@ -170,24 +184,25 @@ void App::editText(const char* title, std::string& value, bool password) {
 }
 
 bool App::confirm(const char* title, const char* body) {
-    int choice = 0;
+    int choice = 1;
     PadState pad;
     padInitializeDefault(&pad);
 
     while (appletMainLoop()) {
-        printf("\x1b[2J\x1b[H");
-        printf("%s\n", title);
-        printf("================\n\n");
-        printf("%s\n\n", body);
-        printf("%s Yes\n", choice == 0 ? ">" : " ");
-        printf("%s No\n\n", choice == 1 ? ">" : " ");
-        printf("A Confirm  B Cancel\n");
-        consoleUpdate(NULL);
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.fillRect(0, 0, UiRenderer::Width, UiRenderer::Height, UiRenderer::rgb(12, 10, 20));
+        ui.drawCard(300, 190, 680, 300, title);
+        ui.drawText(350, 280, body, UiRenderer::rgb(248, 245, 255), 2);
+        ui.drawButton(350, 370, 260, 58, "YES", choice == 0, true);
+        ui.drawButton(670, 370, 260, 58, "NO", choice == 1);
+        ui.drawFooter("LEFT/RIGHT SELECT    A CONFIRM    B CANCEL");
+        ui.endFrame();
 
         padUpdate(&pad);
         u64 buttons = padGetButtonsDown(&pad);
-        if (buttons & HidNpadButton_Up) choice = 0;
-        if (buttons & HidNpadButton_Down) choice = 1;
+        if (buttons & HidNpadButton_Left) choice = 0;
+        if (buttons & HidNpadButton_Right) choice = 1;
         if (buttons & HidNpadButton_A) return choice == 0;
         if (buttons & HidNpadButton_B) return false;
     }
@@ -211,7 +226,6 @@ void App::connectOrDisconnect() {
 
     status = "Connecting...";
     draw();
-    consoleUpdate(NULL);
 
     std::string message;
     if (ssh.connect(config, message)) {
@@ -312,7 +326,7 @@ void App::reboot() {
         lastMessage = "No active SSH connection.";
         return;
     }
-    if (!confirm("Confirm Reboot", "Are you sure you want to reboot the MiSTer?")) return;
+    if (!confirm("CONFIRM REBOOT", "ARE YOU SURE YOU WANT TO REBOOT THE MISTER?")) return;
 
     SshResult result = ssh.runCommand("nohup /sbin/reboot >/dev/null 2>&1 &");
     ssh.disconnect();

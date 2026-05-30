@@ -4,7 +4,6 @@
 #include "app.hpp"
 
 int main(int argc, char* argv[]) {
-    consoleInit(NULL);
     socketInitializeDefault();
     libssh2_init(0);
 
@@ -15,6 +14,5 @@ int main(int argc, char* argv[]) {
 
     libssh2_exit();
     socketExit();
-    consoleExit(NULL);
     return 0;
 }

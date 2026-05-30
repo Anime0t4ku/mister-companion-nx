@@ -4,6 +4,7 @@
 
 #include "config.hpp"
 #include "ssh_client.hpp"
+#include "ui.hpp"
 
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@ private:
 
     AppConfig config;
     SshClient ssh;
+    UiRenderer ui;
     Tab tab = Tab::Connection;
     int selected = 0;
     std::string status = "Disconnected";
@@ -30,9 +32,9 @@ private:
     std::string nowPlaying;
 
     void draw();
+    void drawHeader();
     void drawConnection();
     void drawDevice();
-    void drawFooter();
 
     void handleInput(u64 buttons);
     void handleConnectionInput(u64 buttons);
@@ -51,7 +53,6 @@ private:
 
     void toggleSmb();
     void reboot();
-    void shutdown();
     void returnToMenu();
 
     std::string runCommandMessage(const std::string& command);
