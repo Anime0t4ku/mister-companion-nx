@@ -168,7 +168,18 @@ void UiRenderer::drawCard(int x, int y, int w, int h, const std::string& title) 
     if (!title.empty()) drawText(x + 28, y + 22, title, rgb(238, 232, 255), 3);
 }
 
-void UiRenderer::drawButton(int x, int y, int w, int h, const std::string& label, bool selected, bool danger) {
+void UiRenderer::drawButton(int x, int y, int w, int h, const std::string& label, bool selected, bool danger, bool disabled) {
+    const u32 disabledBase = rgb(25, 23, 34);
+    const u32 disabledBorder = rgb(48, 43, 64);
+    const u32 disabledText = rgb(104, 96, 126);
+
+    if (disabled) {
+        fillRect(x, y, w, h, disabledBase);
+        drawRect(x, y, w, h, disabledBorder, 2);
+        drawText(x + 28, y + (h - 14) / 2, label, disabledText, 2);
+        return;
+    }
+
     const u32 base = danger ? rgb(58, 30, 44) : rgb(36, 31, 54);
     const u32 active = danger ? rgb(155, 54, 80) : rgb(124, 70, 220);
     const u32 border = selected ? active : rgb(67, 57, 92);

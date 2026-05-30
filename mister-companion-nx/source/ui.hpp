@@ -21,7 +21,7 @@ public:
     void drawText(int x, int y, const std::string& text, u32 color, int scale = 2);
     void drawTextCentered(int x, int y, int w, const std::string& text, u32 color, int scale = 2);
     void drawCard(int x, int y, int w, int h, const std::string& title = "");
-    void drawButton(int x, int y, int w, int h, const std::string& label, bool selected, bool danger = false);
+    void drawButton(int x, int y, int w, int h, const std::string& label, bool selected, bool danger = false, bool disabled = false);
     void drawTab(int x, int y, int w, const std::string& label, bool active);
     void drawStatusPill(int x, int y, const std::string& label, bool active);
     void drawFooter(const std::string& text);

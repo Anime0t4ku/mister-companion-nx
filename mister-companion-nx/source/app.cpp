@@ -139,10 +139,11 @@ void App::drawDevice() {
         ui.drawText(76, 532, nowPlaying, UiRenderer::rgb(248, 245, 255), 2);
     }
 
-    ui.drawButton(696, 252, 508, 60, "REFRESH DEVICE INFO", selected == 0);
-    ui.drawButton(696, 334, 508, 60, "TOGGLE SMB STARTUP", selected == 1);
-    ui.drawButton(696, 416, 508, 60, "RETURN TO MISTER MENU", selected == 2);
-    ui.drawButton(696, 498, 508, 60, "REBOOT MISTER", selected == 3, true);
+    const bool actionsEnabled = ssh.isConnected();
+    ui.drawButton(696, 252, 508, 60, "REFRESH DEVICE INFO", selected == 0 && actionsEnabled, false, !actionsEnabled);
+    ui.drawButton(696, 334, 508, 60, "TOGGLE SMB STARTUP", selected == 1 && actionsEnabled, false, !actionsEnabled);
+    ui.drawButton(696, 416, 508, 60, "RETURN TO MISTER MENU", selected == 2 && actionsEnabled, false, !actionsEnabled);
+    ui.drawButton(696, 498, 508, 60, "REBOOT MISTER", selected == 3 && actionsEnabled, true, !actionsEnabled);
 }
 
 void App::drawRemote() {
@@ -167,28 +168,29 @@ void App::drawRemote() {
     ui.drawText(76, 506, "PASSTHROUGH EXIT", UiRenderer::rgb(174, 154, 218), 2);
     ui.drawText(76, 538, "PRESS L3 AND R3 TOGETHER", UiRenderer::rgb(248, 245, 255), 2);
 
+    const bool actionsEnabled = ssh.isConnected();
     const bool installed = remoteInstalled == "Yes";
     const bool running = remoteRunning == "Yes";
     const bool startup = remoteStartup == "Enabled";
 
     if (!installed) {
-        ui.drawButton(696, 280, 508, 60, "INSTALL / UPDATE DAEMON", selected == 0);
-        ui.drawButton(696, 362, 508, 60, "REFRESH REMOTE STATUS", selected == 1);
+        ui.drawButton(696, 280, 508, 60, "INSTALL / UPDATE DAEMON", selected == 0 && actionsEnabled, false, !actionsEnabled);
+        ui.drawButton(696, 362, 508, 60, "REFRESH REMOTE STATUS", selected == 1 && actionsEnabled, false, !actionsEnabled);
         return;
     }
 
     if (running) {
-        ui.drawButton(696, 238, 508, 60, "START PASSTHROUGH MODE", selected == 0);
-        ui.drawButton(696, 320, 508, 60, "STOP REMOTE DAEMON", selected == 1);
-        ui.drawButton(696, 402, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 2);
-        ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3);
+        ui.drawButton(696, 238, 508, 60, "START PASSTHROUGH MODE", selected == 0 && actionsEnabled, false, !actionsEnabled);
+        ui.drawButton(696, 320, 508, 60, "STOP REMOTE DAEMON", selected == 1 && actionsEnabled, false, !actionsEnabled);
+        ui.drawButton(696, 402, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 2 && actionsEnabled, false, !actionsEnabled);
+        ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3 && actionsEnabled, false, !actionsEnabled);
         return;
     }
 
-    ui.drawButton(696, 238, 508, 60, "START REMOTE DAEMON", selected == 0);
-    ui.drawButton(696, 320, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 1);
-    ui.drawButton(696, 402, 508, 60, "UNINSTALL REMOTE DAEMON", selected == 2, true);
-    ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3);
+    ui.drawButton(696, 238, 508, 60, "START REMOTE DAEMON", selected == 0 && actionsEnabled, false, !actionsEnabled);
+    ui.drawButton(696, 320, 508, 60, startup ? "DISABLE START ON BOOT" : "ENABLE START ON BOOT", selected == 1 && actionsEnabled, false, !actionsEnabled);
+    ui.drawButton(696, 402, 508, 60, "UNINSTALL REMOTE DAEMON", selected == 2 && actionsEnabled, true, !actionsEnabled);
+    ui.drawButton(696, 484, 508, 60, "REFRESH REMOTE STATUS", selected == 3 && actionsEnabled, false, !actionsEnabled);
 }
 
 void App::drawPassthrough() {
@@ -221,7 +223,7 @@ void App::handleInput(u64 buttons) {
         else if (tab == Tab::Device) tab = Tab::Remote;
         else tab = Tab::Connection;
         selected = 0;
-        if (tab == Tab::Remote && remoteInstalled == "Not checked") refreshRemoteStatus();
+        if (tab == Tab::Remote && ssh.isConnected() && remoteInstalled == "Not checked") refreshRemoteStatus();
         return;
     }
 
@@ -248,6 +250,11 @@ void App::handleDeviceInput(u64 buttons) {
     if (buttons & HidNpadButton_Down) selected = (selected + 1) % 4;
     if (!(buttons & HidNpadButton_A)) return;
 
+    if (!ssh.isConnected()) {
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+
     switch (selected) {
         case 0: refreshDevice(); break;
         case 1: toggleSmb(); break;
@@ -264,6 +271,11 @@ void App::handleRemoteInput(u64 buttons) {
     if (buttons & HidNpadButton_Up) selected = (selected + actionCount - 1) % actionCount;
     if (buttons & HidNpadButton_Down) selected = (selected + 1) % actionCount;
     if (!(buttons & HidNpadButton_A)) return;
+
+    if (!ssh.isConnected()) {
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
 
     if (!installed) {
         switch (selected) {
@@ -411,6 +423,8 @@ void App::saveConfig() {
 
 void App::connectOrDisconnect() {
     if (ssh.isConnected()) {
+        if (passthroughActive) stopPassthrough();
+        remote.disconnect();
         ssh.disconnect();
         status = "Disconnected";
         lastMessage = "Disconnected.";
