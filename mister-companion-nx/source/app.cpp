@@ -7,10 +7,6 @@
 #include <cstring>
 #include <sstream>
 
-static bool startsWith(const std::string& value, const std::string& prefix) {
-    return value.rfind(prefix, 0) == 0;
-}
-
 static std::vector<std::string> splitWords(const std::string& value) {
     std::stringstream stream(value);
     std::vector<std::string> parts;
@@ -73,8 +69,8 @@ void App::drawConnection() {
 }
 
 void App::drawDevice() {
-    const char* marker[] = {">", " ", " ", " ", " ", " ", " "};
-    for (int i = 0; i < 7; i++) marker[i] = selected == i ? ">" : " ";
+    const char* marker[] = {">", " ", " ", " ", " "};
+    for (int i = 0; i < 5; i++) marker[i] = selected == i ? ">" : " ";
 
     printf("Device\n");
     printf("------\n");
@@ -89,9 +85,7 @@ void App::drawDevice() {
     printf("%s Toggle SMB startup\n", marker[1]);
     printf("%s Return to MiSTer menu\n", marker[2]);
     printf("%s Reboot MiSTer\n", marker[3]);
-    printf("%s Shutdown MiSTer\n", marker[4]);
-    printf("%s Disconnect\n", marker[5]);
-    printf("%s Back to Connection tab\n\n", marker[6]);
+    printf("%s Disconnect\n\n", marker[4]);
     if (!lastMessage.empty()) printf("Message: %s\n", lastMessage.c_str());
 }
 
@@ -132,8 +126,8 @@ void App::handleConnectionInput(u64 buttons) {
 }
 
 void App::handleDeviceInput(u64 buttons) {
-    if (buttons & HidNpadButton_Up) selected = (selected + 6) % 7;
-    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 7;
+    if (buttons & HidNpadButton_Up) selected = (selected + 4) % 5;
+    if (buttons & HidNpadButton_Down) selected = (selected + 1) % 5;
     if (!(buttons & HidNpadButton_A)) return;
 
     switch (selected) {
@@ -141,9 +135,11 @@ void App::handleDeviceInput(u64 buttons) {
         case 1: toggleSmb(); break;
         case 2: returnToMenu(); break;
         case 3: reboot(); break;
-        case 4: shutdown(); break;
-        case 5: ssh.disconnect(); status = "Disconnected"; lastMessage = "Disconnected."; break;
-        case 6: tab = Tab::Connection; selected = 0; break;
+        case 4:
+            ssh.disconnect();
+            status = "Disconnected";
+            lastMessage = "Disconnected.";
+            break;
     }
 }
 
@@ -326,23 +322,6 @@ void App::reboot() {
     smbStatus = "Rebooting...";
     nowPlaying.clear();
     lastMessage = result.success ? "Reboot command sent." : "Reboot command may have failed.";
-}
-
-void App::shutdown() {
-    if (!ssh.isConnected()) {
-        lastMessage = "No active SSH connection.";
-        return;
-    }
-    if (!confirm("Confirm Shutdown", "Are you sure you want to shutdown the MiSTer?")) return;
-
-    SshResult result = ssh.runCommand("nohup /sbin/poweroff >/dev/null 2>&1 &");
-    ssh.disconnect();
-    status = "Disconnected";
-    sdStorage = "Powered off";
-    usbStorage = "Powered off";
-    smbStatus = "Powered off";
-    nowPlaying.clear();
-    lastMessage = result.success ? "Shutdown command sent." : "Shutdown command may have failed.";
 }
 
 std::string App::formatDfLine(const std::string& line) {
