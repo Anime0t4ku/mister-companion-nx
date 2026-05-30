@@ -3,6 +3,7 @@
 #include <switch.h>
 
 #include "config.hpp"
+#include "mister_ini.hpp"
 #include "remote_client.hpp"
 #include "ssh_client.hpp"
 #include "ui.hpp"
@@ -20,6 +21,7 @@ private:
         Device,
         Remote,
         Scripts,
+        Settings,
     };
 
     enum class ScriptId {
@@ -54,6 +56,15 @@ private:
     bool passthroughActive = false;
     int selectedScript = 0;
     std::vector<std::vector<std::string>> cachedScriptStatus;
+    std::vector<std::string> settingsIniFiles;
+    std::vector<std::string> settingsFonts;
+    std::string selectedSettingsIni = "MiSTer.ini";
+    std::string settingsIniText;
+    MisterIniEasyValues settingsEasy;
+    bool settingsLoaded = false;
+    bool settingsDirty = false;
+    int selectedSettings = 0;
+    int settingsScroll = 0;
 
     void draw();
     void drawHeader();
@@ -61,6 +72,7 @@ private:
     void drawDevice();
     void drawRemote();
     void drawScripts();
+    void drawSettings();
     void drawPassthrough();
 
     void handleInput(u64 buttons);
@@ -68,6 +80,7 @@ private:
     void handleDeviceInput(u64 buttons);
     void handleRemoteInput(u64 buttons);
     void handleScriptsInput(u64 buttons);
+    void handleSettingsInput(u64 buttons);
     void handlePassthroughInput(u64 down, u64 up, u64 held);
 
     void editText(const char* title, std::string& value, bool password = false);
@@ -113,6 +126,21 @@ private:
     bool askField(const char* title, std::string& value, bool password = false);
     bool askYesNo(const char* title, const char* body, bool defaultYes = false);
     void ensureScriptsDirs();
+
+    void loadSettingsTab(bool force = false);
+    bool ensureRemoteMisterIni();
+    void scanSettingsIniFiles();
+    void scanSettingsFonts();
+    void loadSelectedSettingsIni();
+    void saveSettingsIni();
+    void restoreSettingsDefaults();
+    void cycleSettingsValue(int index);
+    std::string settingsLabel(int index) const;
+    std::string settingsValue(int index) const;
+    int settingsOptionCount() const;
+    std::vector<std::string> settingsOptionsForIndex(int index) const;
+    std::string remoteReadTextFile(const std::string& path);
+    bool remoteWriteTextFile(const std::string& path, const std::string& text, std::string& error);
 
     std::string runCommandMessage(const std::string& command);
     std::string formatDfLine(const std::string& line);

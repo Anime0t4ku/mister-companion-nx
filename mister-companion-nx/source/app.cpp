@@ -29,6 +29,7 @@ static const char* SyncthingPath = "/media/fat/Scripts/syncthing.sh";
 static const char* RaViewerPath = "/media/fat/Scripts/ra_viewer.sh";
 static const char* RaViewerConfigPath = "/media/fat/Scripts/.config/ra_viewer/config.ini";
 static const char* UserStartupPath = "/media/fat/linux/user-startup.sh";
+static const char* DefaultMisterIniUrl = "https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/assets/MiSTer_example.ini";
 
 static const char* UrlMigrateSd = "https://raw.githubusercontent.com/Natrox/MiSTer_Utils_Natrox/main/scripts/migrate_sd.sh";
 static const char* UrlCifsMount = "https://raw.githubusercontent.com/MiSTer-devel/Scripts_MiSTer/master/cifs_mount.sh";
@@ -323,10 +324,11 @@ void App::drawHeader() {
     ui.drawText(42, 30, "MISTER COMPANION NX", UiRenderer::rgb(248, 245, 255), 3);
     ui.drawStatusPill(UiRenderer::Width - 280, 28, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected());
 
-    ui.drawTab(40, 110, 190, "CONNECTION", tab == Tab::Connection);
-    ui.drawTab(250, 110, 160, "DEVICE", tab == Tab::Device);
-    ui.drawTab(430, 110, 160, "REMOTE", tab == Tab::Remote);
-    ui.drawTab(610, 110, 170, "SCRIPTS", tab == Tab::Scripts);
+    ui.drawTab(36, 110, 180, "CONNECTION", tab == Tab::Connection);
+    ui.drawTab(232, 110, 140, "DEVICE", tab == Tab::Device);
+    ui.drawTab(388, 110, 140, "REMOTE", tab == Tab::Remote);
+    ui.drawTab(544, 110, 150, "SCRIPTS", tab == Tab::Scripts);
+    ui.drawTab(710, 110, 160, "SETTINGS", tab == Tab::Settings);
 }
 
 void App::draw() {
@@ -343,11 +345,14 @@ void App::draw() {
     if (tab == Tab::Connection) drawConnection();
     else if (tab == Tab::Device) drawDevice();
     else if (tab == Tab::Remote) drawRemote();
-    else drawScripts();
+    else if (tab == Tab::Scripts) drawScripts();
+    else drawSettings();
 
     ui.drawMessage(lastMessage);
     if (tab == Tab::Scripts) {
         ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R TABS    ZL/ZR SCRIPT    + EXIT");
+    } else if (tab == Tab::Settings) {
+        ui.drawFooter("UP/DOWN SELECT    A CYCLE    X SAVE    B CANCEL    L/R TABS    ZL/ZR INI    + EXIT");
     } else {
         ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R SWITCH TAB    + EXIT");
     }
@@ -482,6 +487,391 @@ void App::drawScripts() {
     }
 }
 
+
+void App::drawSettings() {
+    ui.drawCard(40, 176, 1200, 424, "MISTER SETTINGS");
+
+    const std::string statusText = settingsDirty ? "UNSAVED CHANGES" : "READY";
+    ui.drawTextCentered(460, 196, 360, statusText, settingsDirty ? UiRenderer::rgb(232, 190, 120) : UiRenderer::rgb(112, 232, 165), 2);
+    ui.drawText(892, 196, "INI: " + safeText(selectedSettingsIni, "MiSTer.ini"), UiRenderer::rgb(174, 154, 218), 2);
+
+    const bool actionsEnabled = ssh.isConnected();
+    if (!actionsEnabled) {
+        ui.drawText(76, 252, "CONNECT TO A MISTER FIRST", UiRenderer::rgb(232, 130, 160), 3);
+        ui.drawText(76, 310, "SETTINGS EDITING IS DISABLED WHILE DISCONNECTED.", UiRenderer::rgb(218, 208, 238), 2);
+        return;
+    }
+
+    if (!settingsLoaded) {
+        ui.drawText(76, 252, "SETTINGS NOT LOADED", UiRenderer::rgb(232, 190, 120), 3);
+        ui.drawText(76, 310, "PRESS A TO LOAD MISTER.INI SETTINGS.", UiRenderer::rgb(218, 208, 238), 2);
+        ui.drawButton(76, 390, 460, 58, "LOAD SETTINGS", selectedSettings == 0, false, false);
+        return;
+    }
+
+    const int count = settingsOptionCount();
+    const int visible = 5;
+    if (selectedSettings < settingsScroll) settingsScroll = selectedSettings;
+    if (selectedSettings >= settingsScroll + visible) settingsScroll = selectedSettings - visible + 1;
+    if (settingsScroll < 0) settingsScroll = 0;
+    if (settingsScroll > std::max(0, count - visible)) settingsScroll = std::max(0, count - visible);
+
+    const int rowX = 76;
+    const int rowW = 1128;
+    const int labelX = rowX + 28;
+    const int valueX = rowX + 520;
+    int y = 276;
+
+    for (int i = settingsScroll; i < count && i < settingsScroll + visible; i++) {
+        const bool isRestore = settingsLabel(i) == "Restore Defaults";
+        const bool isSelected = selectedSettings == i;
+        const std::string label = settingsLabel(i);
+        const std::string value = settingsValue(i);
+
+        const u32 base = isRestore ? UiRenderer::rgb(58, 30, 44) : UiRenderer::rgb(36, 31, 54);
+        const u32 active = isRestore ? UiRenderer::rgb(155, 54, 80) : UiRenderer::rgb(124, 70, 220);
+        const u32 border = isSelected ? active : UiRenderer::rgb(67, 57, 92);
+        const u32 valueColor = value.empty() ? UiRenderer::rgb(174, 154, 218) : UiRenderer::rgb(248, 245, 255);
+
+        ui.fillRect(rowX, y, rowW, 50, isSelected ? active : base);
+        ui.drawRect(rowX, y, rowW, 50, border, isSelected ? 4 : 2);
+        ui.drawText(labelX, y + 18, label, UiRenderer::rgb(218, 208, 238), 2);
+
+        if (!value.empty()) {
+            ui.fillRect(valueX - 18, y + 8, rowW - (valueX - rowX) - 18, 34, isSelected ? UiRenderer::rgb(104, 58, 190) : UiRenderer::rgb(28, 24, 42));
+            ui.drawText(valueX, y + 18, value, valueColor, 2);
+        }
+
+        y += 58;
+    }
+
+    std::string counter = std::to_string(selectedSettings + 1) + " / " + std::to_string(count);
+    ui.drawTextCentered(76, 576, 1128, counter, UiRenderer::rgb(174, 154, 218), 2);
+}
+
+void App::handleSettingsInput(u64 buttons) {
+    if (!ssh.isConnected()) {
+        if (buttons & HidNpadButton_A) lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+
+    if (!settingsLoaded) {
+        if (buttons & HidNpadButton_A) loadSettingsTab(true);
+        return;
+    }
+
+    const int count = settingsOptionCount();
+
+    if ((buttons & HidNpadButton_ZL) || (buttons & HidNpadButton_ZR)) {
+        if (!settingsIniFiles.empty()) {
+            auto it = std::find(settingsIniFiles.begin(), settingsIniFiles.end(), selectedSettingsIni);
+            int index = it == settingsIniFiles.end() ? 0 : static_cast<int>(it - settingsIniFiles.begin());
+            if (buttons & HidNpadButton_ZL) index = (index + static_cast<int>(settingsIniFiles.size()) - 1) % static_cast<int>(settingsIniFiles.size());
+            if (buttons & HidNpadButton_ZR) index = (index + 1) % static_cast<int>(settingsIniFiles.size());
+            selectedSettingsIni = settingsIniFiles[index];
+            loadSelectedSettingsIni();
+            settingsDirty = false;
+            lastMessage = "Loaded " + selectedSettingsIni + ".";
+        }
+        return;
+    }
+
+    if (buttons & HidNpadButton_Up) selectedSettings = (selectedSettings + count - 1) % count;
+    if (buttons & HidNpadButton_Down) selectedSettings = (selectedSettings + 1) % count;
+
+    if (buttons & HidNpadButton_A) cycleSettingsValue(selectedSettings);
+    if (buttons & HidNpadButton_X) saveSettingsIni();
+    if (buttons & HidNpadButton_B) {
+        loadSelectedSettingsIni();
+        settingsDirty = false;
+        lastMessage = "Settings changes discarded.";
+    }
+}
+
+int App::settingsOptionCount() const {
+    return 12;
+}
+
+std::string App::settingsLabel(int index) const {
+    switch (index) {
+        case 0: return "HDMI Mode";
+        case 1: return "Resolution";
+        case 2: return "HDMI Scaling Mode";
+        case 3: return "HDMI Audio";
+        case 4: return "HDR";
+        case 5: return "HDMI Range";
+        case 6: return "Analogue Output";
+        case 7: return "MiSTer Logo";
+        case 8: return "Font";
+        case 9: return "AmigaVision Preset";
+        case 10: return "Menu CRT Preset";
+        case 11: return "Restore Defaults";
+        default: return "";
+    }
+}
+
+std::string App::settingsValue(int index) const {
+    switch (index) {
+        case 0: return settingsEasy.hdmiMode;
+        case 1: return settingsEasy.resolution;
+        case 2: return settingsEasy.scaling;
+        case 3: return settingsEasy.hdmiAudio;
+        case 4: return settingsEasy.hdr;
+        case 5: return settingsEasy.hdmiLimited;
+        case 6: return settingsEasy.analogue;
+        case 7: return settingsEasy.logo;
+        case 8: return safeText(settingsEasy.font, "Default");
+        case 9: return settingsEasy.amigavisionPreset;
+        case 10: return settingsEasy.menuCrtPreset;
+        default: return "";
+    }
+}
+
+std::vector<std::string> App::settingsOptionsForIndex(int index) const {
+    switch (index) {
+        case 0: return MisterIni::hdmiModeOptions();
+        case 1: return MisterIni::resolutionOptions();
+        case 2: return MisterIni::scalingOptions();
+        case 3: return MisterIni::hdmiAudioOptions();
+        case 4: return MisterIni::hdrOptions();
+        case 5: return MisterIni::hdmiRangeOptions();
+        case 6: return MisterIni::analogueOptions();
+        case 7: return MisterIni::enabledDisabledOptions();
+        case 8: return settingsFonts.empty() ? std::vector<std::string>{"Default"} : settingsFonts;
+        case 9: return MisterIni::enabledDisabledOptions();
+        case 10: return MisterIni::menuCrtPresetOptions();
+        default: return {};
+    }
+}
+
+static std::string nextOptionValue(const std::vector<std::string>& options, const std::string& current) {
+    if (options.empty()) return current;
+    auto it = std::find(options.begin(), options.end(), current);
+    if (it == options.end()) return options.front();
+    ++it;
+    if (it == options.end()) return options.front();
+    return *it;
+}
+
+void App::cycleSettingsValue(int index) {
+    if (index == 11) {
+        restoreSettingsDefaults();
+        return;
+    }
+
+    std::vector<std::string> options = settingsOptionsForIndex(index);
+    if (options.empty()) return;
+
+    if (index == 8) {
+        PadState pad;
+        padInitializeDefault(&pad);
+
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+            u64 held = padGetButtons(&pad);
+            if ((held & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X)) == 0) break;
+            ui.beginFrame();
+            ui.drawCard(220, 150, 840, 410, "SELECT FONT");
+            ui.drawTextCentered(260, 320, 760, "RELEASE BUTTONS", UiRenderer::rgb(174, 154, 218), 2);
+            ui.drawFooter("UP/DOWN SELECT    A SELECT    X SAVE & BACK    B CANCEL");
+            ui.endFrame();
+        }
+
+        int selectedFont = 0;
+        auto it = std::find(options.begin(), options.end(), settingsEasy.font);
+        if (it != options.end()) selectedFont = static_cast<int>(it - options.begin());
+        int pendingFont = selectedFont;
+        int scroll = 0;
+        const int visible = 6;
+
+        while (appletMainLoop()) {
+            if (pendingFont < scroll) scroll = pendingFont;
+            if (pendingFont >= scroll + visible) scroll = pendingFont - visible + 1;
+            if (scroll < 0) scroll = 0;
+            if (scroll > std::max(0, static_cast<int>(options.size()) - visible)) scroll = std::max(0, static_cast<int>(options.size()) - visible);
+
+            ui.beginFrame();
+            ui.drawCard(220, 124, 840, 472, "SELECT FONT");
+            ui.drawText(260, 176, "Selected", UiRenderer::rgb(174, 154, 218), 2);
+            ui.drawText(410, 176, safeText(options[selectedFont], "Default"), UiRenderer::rgb(248, 245, 255), 2);
+
+            int y = 226;
+            for (int i = scroll; i < static_cast<int>(options.size()) && i < scroll + visible; i++) {
+                const bool rowSelected = i == pendingFont;
+                const bool rowActive = i == selectedFont;
+                std::string label = options[i];
+                if (label.size() > 40) label = label.substr(0, 37) + "...";
+                label = rowActive ? ("[x] " + label) : ("[ ] " + label);
+                ui.drawButton(260, y, 760, 46, label, rowSelected, false, false);
+                if (rowActive) {
+                    ui.drawText(880, y + 15, "SELECTED", UiRenderer::rgb(112, 232, 165), 2);
+                }
+                y += 56;
+            }
+
+            std::string counter = std::to_string(pendingFont + 1) + " / " + std::to_string(options.size());
+            ui.drawTextCentered(260, 566, 760, counter, UiRenderer::rgb(174, 154, 218), 2);
+            ui.drawFooter("UP/DOWN MOVE    A SELECT    X SAVE & BACK    B CANCEL");
+            ui.endFrame();
+
+            padUpdate(&pad);
+            const u64 buttons = padGetButtonsDown(&pad);
+            if (buttons & HidNpadButton_Up) pendingFont = (pendingFont + static_cast<int>(options.size()) - 1) % static_cast<int>(options.size());
+            if (buttons & HidNpadButton_Down) pendingFont = (pendingFont + 1) % static_cast<int>(options.size());
+            if (buttons & HidNpadButton_A) selectedFont = pendingFont;
+            if (buttons & HidNpadButton_X) {
+                settingsEasy.font = options[selectedFont];
+                settingsDirty = true;
+                lastMessage = "Font selected.";
+                return;
+            }
+            if (buttons & HidNpadButton_B) {
+                lastMessage = "Font selection cancelled.";
+                return;
+            }
+        }
+        return;
+    }
+
+    switch (index) {
+        case 0: settingsEasy.hdmiMode = nextOptionValue(options, settingsEasy.hdmiMode); break;
+        case 1: settingsEasy.resolution = nextOptionValue(options, settingsEasy.resolution); break;
+        case 2: settingsEasy.scaling = nextOptionValue(options, settingsEasy.scaling); break;
+        case 3: settingsEasy.hdmiAudio = nextOptionValue(options, settingsEasy.hdmiAudio); break;
+        case 4: settingsEasy.hdr = nextOptionValue(options, settingsEasy.hdr); break;
+        case 5: settingsEasy.hdmiLimited = nextOptionValue(options, settingsEasy.hdmiLimited); break;
+        case 6: settingsEasy.analogue = nextOptionValue(options, settingsEasy.analogue); break;
+        case 7: settingsEasy.logo = nextOptionValue(options, settingsEasy.logo); break;
+        case 8: settingsEasy.font = nextOptionValue(options, settingsEasy.font); break;
+        case 9: settingsEasy.amigavisionPreset = nextOptionValue(options, settingsEasy.amigavisionPreset); break;
+        case 10: settingsEasy.menuCrtPreset = nextOptionValue(options, settingsEasy.menuCrtPreset); break;
+    }
+    settingsDirty = true;
+}
+
+void App::loadSettingsTab(bool force) {
+    if (!ssh.isConnected()) {
+        settingsLoaded = false;
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+    if (settingsLoaded && !force) return;
+    if (!ensureRemoteMisterIni()) return;
+    scanSettingsIniFiles();
+    scanSettingsFonts();
+    if (settingsIniFiles.empty()) {
+        settingsLoaded = false;
+        lastMessage = "No MiSTer.ini files found.";
+        return;
+    }
+    if (std::find(settingsIniFiles.begin(), settingsIniFiles.end(), selectedSettingsIni) == settingsIniFiles.end()) {
+        selectedSettingsIni = settingsIniFiles.front();
+    }
+    loadSelectedSettingsIni();
+}
+
+bool App::ensureRemoteMisterIni() {
+    std::string command =
+        "cd /media/fat 2>/dev/null || exit 1; "
+        "if [ ! -f MiSTer.ini ]; then "
+        "if [ -f MiSTer_Example.ini ]; then cp MiSTer_Example.ini MiSTer.ini; "
+        "else wget --no-check-certificate -O MiSTer.ini " + shellQuote(DefaultMisterIniUrl) + "; fi; fi; "
+        "test -s MiSTer.ini";
+    SshResult result = ssh.runCommand(command);
+    if (!result.success) {
+        lastMessage = result.error.empty() ? "Unable to create MiSTer.ini." : result.error;
+        return false;
+    }
+    return true;
+}
+
+void App::scanSettingsIniFiles() {
+    settingsIniFiles.clear();
+    SshResult result = ssh.runCommand(
+        "cd /media/fat 2>/dev/null || exit 0; "
+        "for f in MiSTer.ini MiSTer_*.ini; do [ -f \"$f\" ] && echo \"$f\"; done"
+    );
+    if (result.success) settingsIniFiles = MisterIni::sortIniFiles(splitLines(result.output));
+}
+
+void App::scanSettingsFonts() {
+    settingsFonts.clear();
+    settingsFonts.push_back("Default");
+    SshResult result = ssh.runCommand(
+        "cd /media/fat/font 2>/dev/null || exit 0; "
+        "for f in *.pf; do [ -f \"$f\" ] && echo \"$f\"; done"
+    );
+    if (result.success) {
+        for (const std::string& line : splitLines(result.output)) {
+            std::string font = trim(line);
+            if (!font.empty() && std::find(settingsFonts.begin(), settingsFonts.end(), font) == settingsFonts.end()) settingsFonts.push_back(font);
+        }
+    }
+}
+
+std::string App::remoteReadTextFile(const std::string& path) {
+    SshResult result = ssh.runCommand("cat " + shellQuote(path));
+    if (!result.success) return "";
+    return result.output;
+}
+
+bool App::remoteWriteTextFile(const std::string& path, const std::string& text, std::string& error) {
+    std::string normalized = text;
+    if (normalized.empty() || normalized.back() != '\n') normalized += "\n";
+    std::string marker = "MCNX_EOF_MISTER_INI";
+    while (normalized.find(marker) != std::string::npos) marker += "_X";
+    std::string command = "cat > " + shellQuote(path) + " <<'" + marker + "'\n" + normalized + marker + "\n";
+    SshResult result = ssh.runCommand(command);
+    if (!result.success) {
+        error = result.error.empty() ? "Unable to write INI file." : result.error;
+        return false;
+    }
+    return true;
+}
+
+void App::loadSelectedSettingsIni() {
+    std::string filename = MisterIni::normalizeIniFilename(selectedSettingsIni);
+    if (filename.empty()) filename = "MiSTer.ini";
+    selectedSettingsIni = filename;
+    settingsIniText = remoteReadTextFile("/media/fat/" + filename);
+    if (settingsIniText.empty()) {
+        settingsLoaded = false;
+        lastMessage = "Unable to read " + filename + ".";
+        return;
+    }
+    settingsEasy = MisterIni::easyValuesFromIniText(settingsIniText);
+    if (std::find(settingsFonts.begin(), settingsFonts.end(), settingsEasy.font) == settingsFonts.end()) settingsFonts.push_back(settingsEasy.font);
+    settingsLoaded = true;
+    settingsDirty = false;
+    lastMessage = filename + " loaded.";
+}
+
+void App::saveSettingsIni() {
+    if (!settingsLoaded) return;
+    std::string newText = MisterIni::updateIniText(settingsIniText, settingsEasy);
+    std::string error;
+    if (!remoteWriteTextFile("/media/fat/" + selectedSettingsIni, newText, error)) {
+        lastMessage = error;
+        return;
+    }
+    settingsIniText = newText;
+    settingsDirty = false;
+    lastMessage = selectedSettingsIni + " saved.";
+}
+
+void App::restoreSettingsDefaults() {
+    std::string target = selectedSettingsIni.empty() ? "MiSTer.ini" : selectedSettingsIni;
+    if (!confirm("Restore Defaults", "Replace the selected INI file with the default MiSTer configuration?")) return;
+    std::string command =
+        "cd /media/fat 2>/dev/null || exit 1; "
+        "wget --no-check-certificate -O " + shellQuote(target) + " " + shellQuote(DefaultMisterIniUrl) + " && test -s " + shellQuote(target);
+    showStreamingCommandWindow("Restore Defaults", command, "Defaults restored.", "Restore defaults failed.");
+    scanSettingsIniFiles();
+    scanSettingsFonts();
+    selectedSettingsIni = target;
+    loadSelectedSettingsIni();
+}
+
 void App::drawPassthrough() {
     ui.clear(UiRenderer::rgb(12, 10, 20));
     ui.fillRect(0, 0, UiRenderer::Width, UiRenderer::Height, UiRenderer::rgb(12, 10, 20));
@@ -501,29 +891,34 @@ void App::drawPassthrough() {
 
 void App::handleInput(u64 buttons) {
     if (buttons & HidNpadButton_L) {
-        if (tab == Tab::Connection) tab = Tab::Scripts;
+        if (tab == Tab::Connection) tab = Tab::Settings;
         else if (tab == Tab::Device) tab = Tab::Connection;
         else if (tab == Tab::Remote) tab = Tab::Device;
-        else tab = Tab::Remote;
+        else if (tab == Tab::Scripts) tab = Tab::Remote;
+        else tab = Tab::Scripts;
         selected = 0;
         if (tab == Tab::Scripts) refreshCurrentScriptStatus();
+        if (tab == Tab::Settings) loadSettingsTab();
         return;
     }
     if (buttons & HidNpadButton_R) {
         if (tab == Tab::Connection) tab = Tab::Device;
         else if (tab == Tab::Device) tab = Tab::Remote;
         else if (tab == Tab::Remote) tab = Tab::Scripts;
+        else if (tab == Tab::Scripts) tab = Tab::Settings;
         else tab = Tab::Connection;
         selected = 0;
         if (tab == Tab::Remote && ssh.isConnected() && remoteInstalled == "Not checked") refreshRemoteStatus();
         if (tab == Tab::Scripts) refreshCurrentScriptStatus();
+        if (tab == Tab::Settings) loadSettingsTab();
         return;
     }
 
     if (tab == Tab::Connection) handleConnectionInput(buttons);
     else if (tab == Tab::Device) handleDeviceInput(buttons);
     else if (tab == Tab::Remote) handleRemoteInput(buttons);
-    else handleScriptsInput(buttons);
+    else if (tab == Tab::Scripts) handleScriptsInput(buttons);
+    else handleSettingsInput(buttons);
 }
 
 void App::handleConnectionInput(u64 buttons) {
