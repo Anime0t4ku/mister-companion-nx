@@ -26,6 +26,7 @@ public:
     void drawStatusPill(int x, int y, const std::string& label, bool active);
     void drawFooter(const std::string& text);
     void drawMessage(const std::string& message);
+    void drawImageRgba(int x, int y, int w, int h, const unsigned char* rgba, int imageW, int imageH);
 
     static u32 rgb(u8 r, u8 g, u8 b);
 

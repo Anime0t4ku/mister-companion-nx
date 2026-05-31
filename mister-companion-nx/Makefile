@@ -7,7 +7,7 @@ ROMFS       := romfs
 
 APP_TITLE   := MiSTer Companion NX
 APP_AUTHOR  := Anime0t4ku
-APP_VERSION := 0.5.0
+APP_VERSION := 1.0.0
 ICON        := icon.jpg
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
@@ -17,7 +17,7 @@ CFLAGS   += $(INCLUDE) -D__SWITCH__
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS  := -g $(ARCH)
 LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
-LIBS     := -lssh2 -lmbedtls -lmbedx509 -lmbedcrypto -lz -lnx
+LIBS     := -lssh2 -lmbedtls -lmbedx509 -lmbedcrypto -ljpeg -lz -lnx
 
 include $(DEVKITPRO)/libnx/switch_rules
 

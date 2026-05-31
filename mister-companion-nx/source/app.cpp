@@ -1,12 +1,26 @@
 #include "app.hpp"
+#include "wallpaper_db.hpp"
 
 #include <switch.h>
+#include <zlib.h>
+#include <jpeglib.h>
+#include <setjmp.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <mutex>
+#include <set>
 #include <sstream>
+#include <thread>
 
 static const char* RemoteScriptPath = "/media/fat/Scripts/companion_remote.sh";
 static const char* RemoteScriptUrl = "https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/mister-companion/assets/companion_remote.sh";
@@ -42,6 +56,28 @@ static const char* UrlStaticWallpaper = "https://raw.githubusercontent.com/Anime
 static const char* UrlSyncthingScript = "https://raw.githubusercontent.com/Anime0t4ku/0t4ku-mister-scripts/main/Scripts/syncthing.sh";
 static const char* UrlRaViewer = "https://raw.githubusercontent.com/Anime0t4ku/0t4ku-mister-scripts/main/Scripts/ra_viewer.sh";
 
+static constexpr int WallpaperSourceCount = 4;
+static const char* StaticWallpaperConfigDir = "/media/fat/Scripts/.config/static_wallpaper";
+static const char* StaticWallpaperConfigPath = "/media/fat/Scripts/.config/static_wallpaper/selected_wallpaper.txt";
+static const char* StaticWallpaperTargetJpg = "/media/fat/menu.jpg";
+static const char* StaticWallpaperTargetPng = "/media/fat/menu.png";
+static const char* MisterMenuReloadCommand = "echo \"load_core /media/fat/menu.rbf\" > /dev/MiSTer_cmd";
+
+static const char* RannyDbUrl = "https://raw.githubusercontent.com/Ranny-Snice/Ranny-Snice-Wallpapers/db/db.json.zip";
+static const char* PcnDbUrl = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/db/db/pcnchallenge.json.zip";
+static const char* PcnPremiumDbUrl = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/db/db/pcnpremium.json.zip";
+static const char* Ot4kuDbUrl = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/db/db/0t4kuwallpapers.json.zip";
+
+static const char* RannyRawBase = "https://raw.githubusercontent.com/Ranny-Snice/Ranny-Snice-Wallpapers/main/";
+static const char* PcnRawBase = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/main/";
+static const char* PcnPremiumRawBase = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/main/";
+static const char* Ot4kuRawBase = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/main/";
+
+static constexpr int ExtraCount = 2;
+static const char* RaConfigPath = "/media/fat/retroachievements.cfg";
+
+
+
 static std::vector<std::string> splitWords(const std::string& value) {
     std::stringstream stream(value);
     std::vector<std::string> parts;
@@ -56,12 +92,129 @@ static std::string trim(std::string value) {
     return value;
 }
 
+
+static std::string ellipsizeText(const std::string& text, size_t maxChars) {
+    if (text.size() <= maxChars) return text;
+    if (maxChars <= 3) return text.substr(0, maxChars);
+    return text.substr(0, maxChars - 3) + "...";
+}
+
 static std::string safeText(const std::string& value, const std::string& fallback = "Not set") {
     return value.empty() ? fallback : value;
 }
 
+static std::string subnetBaseFromIp(const std::string& ip) {
+    int a = 0, b = 0, c = 0, d = 0;
+    if (std::sscanf(ip.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return "";
+    if (a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255) return "";
+    return std::to_string(a) + "." + std::to_string(b) + "." + std::to_string(c) + ".";
+}
+
+static std::string currentSubnetBase() {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return "";
+
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+    connect(fd, reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
+
+    sockaddr_in local{};
+    socklen_t len = sizeof(local);
+    std::string out;
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+        char buffer[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &local.sin_addr, buffer, sizeof(buffer))) {
+            out = subnetBaseFromIp(buffer);
+        }
+    }
+    close(fd);
+    return out;
+}
+
+static bool tcpPortOpen(const std::string& host, int port, int timeoutMs) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+
+    int rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+        close(fd);
+        return true;
+    }
+
+    if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+        close(fd);
+        return false;
+    }
+
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(fd, &writeSet);
+
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+    rc = select(fd + 1, nullptr, &writeSet, nullptr, &tv);
+    if (rc <= 0) {
+        close(fd);
+        return false;
+    }
+
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0) {
+        close(fd);
+        return false;
+    }
+
+    close(fd);
+    return error == 0;
+}
+
+static bool hostLooksLikeMister(const std::string& host, const AppConfig& baseConfig) {
+    AppConfig probeConfig = baseConfig;
+    probeConfig.host = host;
+    if (trim(probeConfig.username).empty()) probeConfig.username = "root";
+    if (trim(probeConfig.password).empty()) probeConfig.password = "1";
+
+    SshClient probe;
+    std::string message;
+    if (!probe.connect(probeConfig, message)) {
+        return false;
+    }
+
+    SshResult result = probe.runCommand("test -d /media/fat -a -e /dev/MiSTer_cmd && echo MISTER || echo NOT_MISTER");
+    probe.disconnect();
+
+    return result.success && trim(result.output) == "MISTER";
+}
+
 static bool contains(const std::string& value, const std::string& needle) {
     return value.find(needle) != std::string::npos;
+}
+
+static bool textMentionsReboot(const std::string& text) {
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lower.find("reboot") != std::string::npos ||
+           lower.find("restarting") != std::string::npos ||
+           lower.find("restart") != std::string::npos ||
+           lower.find("going down") != std::string::npos ||
+           lower.find("connection reset") != std::string::npos ||
+           lower.find("broken pipe") != std::string::npos;
 }
 
 static std::string shellQuote(const std::string& value) {
@@ -281,6 +434,138 @@ static bool statusYes(const std::vector<std::string>& lines, const std::string& 
     return statusValue(lines, key) == "YES";
 }
 
+
+static std::string lowerCopyExtra(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static std::string basenameCopy(const std::string& value) {
+    size_t pos = value.find_last_of('/');
+    if (pos == std::string::npos) return value;
+    return value.substr(pos + 1);
+}
+
+static std::vector<std::string> splitByChar(const std::string& value, char delimiter) {
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : value) {
+        if (c == delimiter) {
+            parts.push_back(current);
+            current.clear();
+        } else {
+            current.push_back(c);
+        }
+    }
+    parts.push_back(current);
+    return parts;
+}
+
+static std::string normalizeExtraVersion(std::string value) {
+    value = trim(value);
+    value.erase(std::remove(value.begin(), value.end(), '\r'), value.end());
+    value.erase(std::remove(value.begin(), value.end(), '\n'), value.end());
+    value.erase(std::remove(value.begin(), value.end(), '\t'), value.end());
+    while (!value.empty() && (value.front() == '"' || value.front() == '\'')) value.erase(value.begin());
+    while (!value.empty() && (value.back() == '"' || value.back() == '\'')) value.pop_back();
+
+    const std::string tagNeedle = "/releases/tag/";
+    size_t tagPos = value.find(tagNeedle);
+    if (tagPos != std::string::npos) value = value.substr(tagPos + tagNeedle.size());
+
+    const std::string refNeedle = "refs/tags/";
+    size_t refPos = value.find(refNeedle);
+    if (refPos != std::string::npos) value = value.substr(refPos + refNeedle.size());
+
+    size_t queryPos = value.find('?');
+    if (queryPos != std::string::npos) value = value.substr(0, queryPos);
+
+    size_t hashPos = value.find('#');
+    if (hashPos != std::string::npos) value = value.substr(0, hashPos);
+
+    value = trim(value);
+
+    size_t bracketPos = value.find('[');
+    if (bracketPos != std::string::npos) value = value.substr(0, bracketPos);
+
+    size_t spacePos = value.find_first_of(" ");
+    if (spacePos != std::string::npos) value = value.substr(0, spacePos);
+
+    while (!value.empty() && value.back() == '/') value.pop_back();
+    value = trim(value);
+
+    auto stripPrefix = [&](const std::string& prefix) {
+        if (value.size() >= prefix.size() && lowerCopyExtra(value.substr(0, prefix.size())) == lowerCopyExtra(prefix)) {
+            value = value.substr(prefix.size());
+        }
+    };
+    stripPrefix("release-");
+    stripPrefix("version-");
+    if (value.size() > 1 && (value[0] == 'v' || value[0] == 'V') && std::isdigit(static_cast<unsigned char>(value[1]))) {
+        value.erase(value.begin());
+    }
+    return trim(value);
+}
+
+static std::string jsonStringValueAfter(const std::string& json, size_t start, const std::string& field) {
+    std::string needle = "\"" + field + "\"";
+    size_t fieldPos = json.find(needle, start);
+    if (fieldPos == std::string::npos) return "";
+
+    size_t objectEnd = json.find('}', start);
+    if (objectEnd != std::string::npos && fieldPos > objectEnd) return "";
+
+    size_t colon = json.find(':', fieldPos + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t firstQuote = json.find('"', colon + 1);
+    if (firstQuote == std::string::npos) return "";
+    size_t secondQuote = json.find('"', firstQuote + 1);
+    if (secondQuote == std::string::npos) return "";
+    return json.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+}
+
+static std::string versionForJsonToken(const std::string& json, const std::string& token) {
+    if (json.empty() || token.empty()) return "";
+    std::string needle = "\"" + token + "\"";
+    size_t keyPos = json.find(needle);
+    if (keyPos == std::string::npos) return "";
+
+    size_t colon = json.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t valueStart = json.find_first_not_of(" \r\n\t", colon + 1);
+    if (valueStart == std::string::npos) return "";
+
+    if (json[valueStart] == '"') {
+        size_t endQuote = json.find('"', valueStart + 1);
+        if (endQuote == std::string::npos) return "";
+        return json.substr(valueStart + 1, endQuote - valueStart - 1);
+    }
+
+    std::string version = jsonStringValueAfter(json, valueStart, "version");
+    if (!version.empty()) return version;
+    return jsonStringValueAfter(json, valueStart, "installed_version");
+}
+
+static std::string installedRaVersionForSource(const std::string& json, const std::string& key, const std::string& title, const std::string& repo) {
+    const std::string repoName = basenameCopy(repo);
+    std::vector<std::string> tokens = {
+        key,
+        lowerCopyExtra(key),
+        title,
+        lowerCopyExtra(title),
+        repo,
+        lowerCopyExtra(repo),
+        repoName,
+        lowerCopyExtra(repoName)
+    };
+
+    for (const std::string& token : tokens) {
+        std::string value = versionForJsonToken(json, token);
+        if (!value.empty()) return value;
+    }
+    return "";
+}
+
 static std::string remoteManageCommand(const std::string& action) {
     return std::string(RemoteScriptPath) + " " + action + " --unattended";
 }
@@ -288,6 +573,7 @@ static std::string remoteManageCommand(const std::string& action) {
 void App::run() {
     config = ConfigStore::load();
     cachedScriptStatus.assign(ScriptCount, std::vector<std::string>{"STATUS: NOT CHECKED"});
+    cachedExtraStatus.assign(ExtraCount, std::vector<std::string>{"STATUS: NOT CHECKED"});
     if (!ui.initialize()) return;
 
     PadState pad;
@@ -305,10 +591,11 @@ void App::run() {
             continue;
         }
 
-        if (down & HidNpadButton_Plus) break;
+        if ((down & HidNpadButton_Plus) && tab != Tab::Connection) break;
 
         handleInput(down);
         draw();
+        performPendingExtraUpdateCheck();
     }
 
     if (passthroughActive) stopPassthrough();
@@ -324,11 +611,13 @@ void App::drawHeader() {
     ui.drawText(42, 30, "MISTER COMPANION NX", UiRenderer::rgb(248, 245, 255), 3);
     ui.drawStatusPill(UiRenderer::Width - 280, 28, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected());
 
-    ui.drawTab(36, 110, 180, "CONNECTION", tab == Tab::Connection);
-    ui.drawTab(232, 110, 140, "DEVICE", tab == Tab::Device);
-    ui.drawTab(388, 110, 140, "REMOTE", tab == Tab::Remote);
-    ui.drawTab(544, 110, 150, "SCRIPTS", tab == Tab::Scripts);
-    ui.drawTab(710, 110, 160, "SETTINGS", tab == Tab::Settings);
+    ui.drawTab(24, 110, 150, "CONNECTION", tab == Tab::Connection);
+    ui.drawTab(184, 110, 105, "DEVICE", tab == Tab::Device);
+    ui.drawTab(299, 110, 105, "REMOTE", tab == Tab::Remote);
+    ui.drawTab(414, 110, 120, "SCRIPTS", tab == Tab::Scripts);
+    ui.drawTab(544, 110, 130, "SETTINGS", tab == Tab::Settings);
+    ui.drawTab(684, 110, 155, "WALLPAPERS", tab == Tab::Wallpapers);
+    ui.drawTab(849, 110, 105, "EXTRAS", tab == Tab::Extras);
 }
 
 void App::draw() {
@@ -346,13 +635,25 @@ void App::draw() {
     else if (tab == Tab::Device) drawDevice();
     else if (tab == Tab::Remote) drawRemote();
     else if (tab == Tab::Scripts) drawScripts();
-    else drawSettings();
+    else if (tab == Tab::Settings) drawSettings();
+    else if (tab == Tab::Wallpapers) drawWallpapers();
+    else drawExtras();
 
     ui.drawMessage(lastMessage);
-    if (tab == Tab::Scripts) {
+    if (tab == Tab::Connection) {
+        if (ssh.isConnected()) {
+            ui.drawFooter("A DISCONNECT    L/R TABS");
+        } else {
+            ui.drawFooter(connectionProfileMode ? "UP/DOWN PROFILE    A CONNECT    X EDIT    - DELETE    ZL/ZR MODE    L/R TABS" : "UP/DOWN SELECT    A EDIT/CONNECT    + SAVE PROFILE    - SCAN    ZL/ZR MODE    L/R TABS");
+        }
+    } else if (tab == Tab::Scripts) {
         ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R TABS    ZL/ZR SCRIPT    + EXIT");
     } else if (tab == Tab::Settings) {
         ui.drawFooter("UP/DOWN SELECT    A CYCLE    X SAVE    B CANCEL    L/R TABS    ZL/ZR INI    + EXIT");
+    } else if (tab == Tab::Wallpapers) {
+        ui.drawFooter("UP/DOWN SELECT    A CONFIRM    L/R TABS    ZL/ZR SOURCE    - STATIC WALLPAPER    + EXIT");
+    } else if (tab == Tab::Extras) {
+        ui.drawFooter("UP/DOWN SELECT    A CONFIRM    L/R TABS    ZL/ZR EXTRA    + EXIT");
     } else {
         ui.drawFooter("UP/DOWN SELECT    A CONFIRM/EDIT    L/R SWITCH TAB    + EXIT");
     }
@@ -360,19 +661,67 @@ void App::draw() {
 }
 
 void App::drawConnection() {
-    ui.drawCard(40, 176, 580, 400, "CONNECTION");
-    ui.drawCard(660, 176, 580, 400, "STATUS");
+    const bool connected = ssh.isConnected();
+    const bool showProfileMode = connectionProfileMode && !connected;
+    const int manualSelection = connected ? 3 : selected;
 
-    ui.drawButton(76, 252, 508, 60, "HOST  " + safeText(config.host), selected == 0);
-    ui.drawButton(76, 334, 508, 60, "USER  " + safeText(config.username), selected == 1);
-    ui.drawButton(76, 416, 508, 60, config.password.empty() ? "PASSWORD  NOT SET" : "PASSWORD  ********", selected == 2);
-    ui.drawButton(76, 498, 508, 60, ssh.isConnected() ? "DISCONNECT" : "CONNECT", selected == 3);
+    ui.drawCard(40, 176, 580, 400, "CONNECTION STATUS");
+    ui.drawCard(660, 176, 580, 400, showProfileMode ? "PROFILES" : "MANUAL CONNECTION");
 
-    ui.drawText(696, 254, "CONNECTION STATUS", UiRenderer::rgb(174, 154, 218), 2);
-    ui.drawText(696, 296, status, UiRenderer::rgb(248, 245, 255), 3);
+    ui.drawText(76, 246, "MODE", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 246, showProfileMode ? "PROFILES" : "MANUAL CONNECT", UiRenderer::rgb(248, 245, 255), 2);
 
-    ui.drawText(696, 380, "TIP", UiRenderer::rgb(174, 154, 218), 2);
-    ui.drawText(696, 420, "USE ROOT / 1 FOR DEFAULT MISTER SSH", UiRenderer::rgb(218, 208, 238), 2);
+    ui.drawText(76, 294, "STATUS", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 294, status, ssh.isConnected() ? UiRenderer::rgb(112, 232, 165) : UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 342, "MISTER", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 342, safeText(config.host), UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 390, "USER", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 390, safeText(config.username), UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 438, "PROFILE", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 438, activeProfileName.empty() ? "Not selected" : safeText(activeProfileName), UiRenderer::rgb(248, 245, 255), 2);
+
+    ui.drawText(76, 506, "TIP", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(76, 538, connected ? "DISCONNECT BEFORE EDITING CONNECTION DETAILS" : "ZL/ZR SWITCH MANUAL AND PROFILES", UiRenderer::rgb(218, 208, 238), 2);
+
+    if (!showProfileMode) {
+        ui.drawButton(696, 220, 508, 58, "HOST  " + safeText(config.host), manualSelection == 0, false, connected);
+        ui.drawButton(696, 292, 508, 58, "USER  " + safeText(config.username), manualSelection == 1, false, connected);
+        ui.drawButton(696, 364, 508, 58, config.password.empty() ? "PASSWORD  NOT SET" : "PASSWORD  ********", manualSelection == 2, false, connected);
+        ui.drawButton(696, 436, 508, 58, connected ? "DISCONNECT" : "CONNECT", manualSelection == 3);
+        ui.drawText(696, 526, connected ? "A DISCONNECT" : "+ SAVE PROFILE    - SCAN FOR MISTER", UiRenderer::rgb(218, 208, 238), 2);
+        return;
+    }
+
+    const int count = static_cast<int>(config.profiles.size());
+    if (count <= 0) {
+        ui.drawText(696, 280, "NO PROFILES SAVED", UiRenderer::rgb(248, 245, 255), 3);
+        ui.drawText(696, 340, "SWITCH TO MANUAL MODE AND PRESS +", UiRenderer::rgb(218, 208, 238), 2);
+        ui.drawText(696, 526, "A CONNECT    X EDIT    - DELETE", UiRenderer::rgb(218, 208, 238), 2);
+        return;
+    }
+
+    const int visibleRows = 5;
+    if (selectedProfile < 0) selectedProfile = 0;
+    if (selectedProfile >= count) selectedProfile = count - 1;
+    if (profileScroll > selectedProfile) profileScroll = selectedProfile;
+    if (profileScroll < selectedProfile - visibleRows + 1) profileScroll = selectedProfile - visibleRows + 1;
+    if (profileScroll < 0) profileScroll = 0;
+
+    for (int row = 0; row < visibleRows; ++row) {
+        int index = profileScroll + row;
+        if (index >= count) break;
+        const ConnectionProfile& profile = config.profiles[index];
+        std::string label = profile.name + "  " + profile.host;
+        ui.drawButton(696, 220 + row * 64, 508, 56, ellipsizeText(label, 38), selectedProfile == index);
+    }
+
+    if (count > visibleRows) {
+        ui.drawText(696, 548, std::to_string(selectedProfile + 1) + " / " + std::to_string(count), UiRenderer::rgb(174, 154, 218), 2);
+    }
+    ui.drawText(856, 548, "A CONNECT    X EDIT    - DELETE", UiRenderer::rgb(218, 208, 238), 2);
 }
 
 void App::drawDevice() {
@@ -488,6 +837,46 @@ void App::drawScripts() {
 }
 
 
+void App::drawExtras() {
+    ui.drawCard(40, 176, 580, 400, "EXTRA STATUS");
+    ui.drawCard(660, 176, 580, 400, "EXTRA ACTIONS");
+
+    ExtraId id = static_cast<ExtraId>(selectedExtra);
+    std::string title = extraTitle(id);
+    std::vector<std::string> statusLines = selectedExtra >= 0 && selectedExtra < static_cast<int>(cachedExtraStatus.size())
+        ? cachedExtraStatus[selectedExtra]
+        : std::vector<std::string>{"STATUS: NOT CHECKED"};
+    std::vector<std::string> actions = extraActions(id);
+
+    ui.drawText(76, 236, "EXTRA", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 236, title, UiRenderer::rgb(248, 245, 255), 3);
+    ui.drawText(76, 290, "SUB TAB", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 290, std::to_string(selectedExtra + 1) + " / " + std::to_string(ExtraCount), UiRenderer::rgb(248, 245, 255), 2);
+
+    int y = 346;
+    for (const std::string& line : statusLines) {
+        if (id == ExtraId::RetroAchievementCores) {
+            if (line.rfind("VERSION:", 0) == 0) continue;
+            if (line.rfind("LATEST:", 0) == 0) continue;
+            if (line.rfind("OUTDATED:", 0) == 0) continue;
+            if (line.rfind("OUTDATED_KEYS:", 0) == 0) continue;
+        }
+        if (y > 530) break;
+        ui.drawText(76, y, line, UiRenderer::rgb(218, 208, 238), 2);
+        y += 42;
+    }
+
+    const bool actionsEnabled = ssh.isConnected();
+    int actionY = 232;
+    for (int i = 0; i < static_cast<int>(actions.size()); i++) {
+        if (actionY > 520) break;
+        const bool danger = actions[i].find("UNINSTALL") != std::string::npos || actions[i].find("REMOVE") != std::string::npos;
+        ui.drawButton(696, actionY, 508, 54, actions[i], selected == i && actionsEnabled, danger, !actionsEnabled);
+        actionY += 68;
+    }
+}
+
+
 void App::drawSettings() {
     ui.drawCard(40, 176, 1200, 424, "MISTER SETTINGS");
 
@@ -548,6 +937,938 @@ void App::drawSettings() {
     std::string counter = std::to_string(selectedSettings + 1) + " / " + std::to_string(count);
     ui.drawTextCentered(76, 576, 1128, counter, UiRenderer::rgb(174, 154, 218), 2);
 }
+
+
+std::string App::wallpaperSourceTitle(int index) const {
+    switch (index) {
+        case 0: return "RANNY SNICE";
+        case 1: return "PCN CHALLENGE";
+        case 2: return "PCN PREMIUM";
+        case 3: return "ANIME0T4KU";
+    }
+    return "WALLPAPERS";
+}
+
+
+static std::vector<int> gWallpaperPackTotal;
+static std::vector<int> gWallpaperPackInstalled;
+static std::vector<int> gWallpaperPackMissing;
+static int gWallpaperInstalledTotal = 0;
+static int gWallpaperMissingTotal = 0;
+static bool gWallpaperStatusChecking = false;
+static int gWallpaperStatusSource = -1;
+static int gWallpaperStatusGeneration = 0;
+static std::mutex gWallpaperStatusMutex;
+static int gWallpaperWorkerGeneration = 0;
+static int gWallpaperWorkerSource = -1;
+static std::vector<int> gWallpaperWorkerTotal;
+static std::vector<int> gWallpaperWorkerInstalled;
+static std::vector<int> gWallpaperWorkerMissing;
+static std::vector<std::string> gWallpaperWorkerStatus;
+static std::set<std::string> gWallpaperInstalledNames;
+static std::string gWallpaperStaticActive = "NO";
+static std::string gWallpaperStaticName = "None";
+static std::string gWallpaperStatusToken;
+static int gWallpaperPollDelay = 0;
+
+static std::string lowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static std::string baseNameOnly(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return path;
+    return path.substr(pos + 1);
+}
+
+static std::set<std::string> installedWallpaperNameSet(const std::string& output) {
+    std::set<std::string> installed;
+    for (const std::string& rawLine : splitLines(output)) {
+        std::string line = trim(rawLine);
+        if (line.empty()) continue;
+        installed.insert(lowerCopy(baseNameOnly(line)));
+    }
+    return installed;
+}
+
+static int countInstalledWallpaperEntries(const std::vector<WallpaperDb::Entry>& entries, const std::set<std::string>& installed) {
+    int count = 0;
+    for (const WallpaperDb::Entry& entry : entries) {
+        if (installed.count(lowerCopy(entry.name))) count++;
+    }
+    return count;
+}
+
+static std::string wallpaperEntriesHeredoc(const std::vector<WallpaperDb::Entry>& entries, bool namesOnly) {
+    std::string text;
+    for (const WallpaperDb::Entry& entry : entries) {
+        if (entry.name.empty()) continue;
+        text += entry.name;
+        if (!namesOnly) {
+            text += "|";
+            text += entry.url;
+        }
+        text += "\n";
+    }
+    return text;
+}
+
+static std::string wallpaperInstallCommandFromEntries(const std::vector<WallpaperDb::Entry>& entries) {
+    std::string command;
+    command += "mkdir -p /media/fat/wallpapers\n";
+    command += "LIST=/tmp/mc_wallpaper_install_$$.txt\n";
+    command += "cat > \"$LIST\" <<'MCWALLPAPERS'\n";
+    command += wallpaperEntriesHeredoc(entries, false);
+    command += "MCWALLPAPERS\n";
+    command += R"SH(
+INSTALLED_LIST=/tmp/mc_wallpaper_installed_$$.txt
+find /media/fat/wallpapers -maxdepth 1 -type f 2>/dev/null | while read -r installed_path; do
+    basename "$installed_path" | tr 'A-Z' 'a-z'
+done | sort -u > "$INSTALLED_LIST"
+is_installed_name() {
+    check_name=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    grep -Fx "$check_name" "$INSTALLED_LIST" >/dev/null 2>&1
+}
+echo Installing wallpapers...
+COUNT=0
+SKIP=0
+FAIL=0
+while IFS='|' read -r name url; do
+    [ -z "$name" ] && continue
+    if is_installed_name "$name"; then
+        echo "Skipped $name"
+        SKIP=$((SKIP + 1))
+        continue
+    fi
+    echo "Downloading $name..."
+    if wget --no-check-certificate -q -O "/media/fat/wallpapers/$name" "$url" && [ -s "/media/fat/wallpapers/$name" ]; then
+        printf '%s\n' "$name" | tr 'A-Z' 'a-z' >> "$INSTALLED_LIST"
+        sort -u "$INSTALLED_LIST" -o "$INSTALLED_LIST"
+        echo "Installed $name"
+        COUNT=$((COUNT + 1))
+    else
+        echo "Failed $name"
+        rm -f "/media/fat/wallpapers/$name"
+        FAIL=$((FAIL + 1))
+    fi
+done < "$LIST"
+rm -f "$LIST" "$INSTALLED_LIST"
+sync
+echo "Installed $COUNT wallpaper(s), skipped $SKIP, failed $FAIL."
+[ "$FAIL" -eq 0 ]
+)SH";
+    return command;
+}
+
+static std::string wallpaperRemoveCommandFromEntries(const std::vector<WallpaperDb::Entry>& entries) {
+    std::string command;
+    command += "LIST=/tmp/mc_wallpaper_remove_$$.txt\n";
+    command += "cat > \"$LIST\" <<'MCWALLPAPERS'\n";
+    command += wallpaperEntriesHeredoc(entries, true);
+    command += "MCWALLPAPERS\n";
+    command += R"SH(
+echo Removing installed wallpapers from selected source...
+COUNT=0
+installed_path_for_name() {
+    check_name=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    find /media/fat/wallpapers -maxdepth 1 -type f 2>/dev/null | while read -r installed_path; do
+        installed_name=$(basename "$installed_path" | tr 'A-Z' 'a-z')
+        if [ "$installed_name" = "$check_name" ]; then
+            printf '%s\n' "$installed_path"
+            exit 0
+        fi
+    done | head -n 1
+}
+while read -r name; do
+    [ -z "$name" ] && continue
+    target=$(installed_path_for_name "$name")
+    if [ -n "$target" ] && [ -f "$target" ]; then
+        rm -f "$target" && echo "Removed $(basename "$target")" && COUNT=$((COUNT + 1))
+    fi
+done < "$LIST"
+rm -f "$LIST"
+sync
+echo "Removed $COUNT wallpaper(s)."
+)SH";
+    return command;
+}
+
+static const char* wallpaperDbUrlForSource(int source) {
+    switch (source) {
+        case 0: return RannyDbUrl;
+        case 1: return PcnDbUrl;
+        case 2: return PcnPremiumDbUrl;
+        case 3: return Ot4kuDbUrl;
+    }
+    return "";
+}
+
+static const char* wallpaperRawBaseForSource(int source) {
+    switch (source) {
+        case 0: return RannyRawBase;
+        case 1: return PcnRawBase;
+        case 2: return PcnPremiumRawBase;
+        case 3: return Ot4kuRawBase;
+    }
+    return "";
+}
+
+static std::vector<unsigned char> decodeBase64Text(const std::string& text) {
+    static const signed char table[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+
+    std::vector<unsigned char> out;
+    int val = 0;
+    int bits = -8;
+    for (unsigned char c : text) {
+        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') {
+            if (c == '=') break;
+            continue;
+        }
+        int decoded = table[c];
+        if (decoded < 0) continue;
+        val = (val << 6) + decoded;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<unsigned char>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+static bool wallpaperEntriesFromZipBytes(int source, const std::string& filterMode, const std::vector<unsigned char>& data, std::vector<WallpaperDb::Entry>& entries, std::string& error) {
+    return WallpaperDb::parseEntriesFromData(data, wallpaperRawBaseForSource(source), filterMode, entries, error);
+}
+
+std::vector<std::string> App::wallpaperActions(int index) const {
+    std::vector<std::string> actions;
+    if (!ssh.isConnected()) {
+        if (index == 0) {
+            actions.push_back("INSTALL 16:9 WALLPAPERS");
+            actions.push_back("INSTALL 4:3 WALLPAPERS");
+        } else {
+            actions.push_back("INSTALL WALLPAPERS");
+        }
+        return actions;
+    }
+
+    if (gWallpaperStatusChecking && gWallpaperStatusSource == index) {
+        return actions;
+    }
+
+    auto addPackAction = [&](int packIndex, const std::string& installLabel, const std::string& updateLabel) {
+        const int total = packIndex < static_cast<int>(gWallpaperPackTotal.size()) ? gWallpaperPackTotal[packIndex] : 0;
+        const int installed = packIndex < static_cast<int>(gWallpaperPackInstalled.size()) ? gWallpaperPackInstalled[packIndex] : 0;
+        const int missing = packIndex < static_cast<int>(gWallpaperPackMissing.size()) ? gWallpaperPackMissing[packIndex] : 0;
+
+        if (total <= 0) {
+            actions.push_back(installLabel);
+        } else if (installed <= 0) {
+            actions.push_back(installLabel);
+        } else if (missing > 0) {
+            actions.push_back(updateLabel);
+        }
+    };
+
+    if (index == 0) {
+        addPackAction(0, "INSTALL 16:9 WALLPAPERS", "UPDATE 16:9 WALLPAPERS");
+        addPackAction(1, "INSTALL 4:3 WALLPAPERS", "UPDATE 4:3 WALLPAPERS");
+    } else {
+        addPackAction(0, "INSTALL WALLPAPERS", "UPDATE WALLPAPERS");
+    }
+
+    if (gWallpaperInstalledTotal > 0) {
+        actions.push_back("REMOVE INSTALLED WALLPAPERS");
+    }
+
+    return actions;
+}
+
+void App::refreshWallpaperStatus() {
+    cachedWallpaperStatus.clear();
+    gWallpaperPackTotal.clear();
+    gWallpaperPackInstalled.clear();
+    gWallpaperPackMissing.clear();
+    gWallpaperInstalledTotal = 0;
+    gWallpaperMissingTotal = 0;
+    gWallpaperStatusChecking = false;
+    gWallpaperStatusSource = selectedWallpaperSource;
+    gWallpaperStatusToken.clear();
+    gWallpaperPollDelay = 0;
+
+    if (!ssh.isConnected()) {
+        cachedWallpaperStatus = {"STATUS: DISCONNECTED"};
+        return;
+    }
+
+    cachedWallpaperStatus = {"STATUS: CHECKING...", "STEP: READING INSTALLED"};
+    const int generation = ++gWallpaperStatusGeneration;
+    const int source = selectedWallpaperSource;
+
+    SshResult listResult = ssh.runCommand("find /media/fat/wallpapers -maxdepth 1 -type f 2>/dev/null");
+    gWallpaperInstalledNames = listResult.success ? installedWallpaperNameSet(listResult.output) : std::set<std::string>();
+
+    SshResult active = ssh.runCommand("test -f /media/fat/menu.jpg -o -f /media/fat/menu.png && echo YES || echo NO");
+    gWallpaperStaticActive = active.success ? trim(active.output) : "NO";
+    if (gWallpaperStaticActive.empty()) gWallpaperStaticActive = "NO";
+
+    SshResult savedResult = ssh.runCommand("cat /media/fat/Scripts/.config/static_wallpaper/selected_wallpaper.txt 2>/dev/null | sed 's#.*/##'");
+    gWallpaperStaticName = savedResult.success ? trim(savedResult.output) : "";
+    if (gWallpaperStaticName.empty()) gWallpaperStaticName = "None";
+    gWallpaperStaticName = ellipsizeText(gWallpaperStaticName, 34);
+
+    cachedWallpaperStatus = {"STATUS: CHECKING...", "STEP: DOWNLOADING DATABASE"};
+    gWallpaperStatusChecking = true;
+    gWallpaperStatusSource = source;
+    gWallpaperWorkerGeneration = generation;
+    gWallpaperWorkerSource = source;
+    gWallpaperStatusToken = "/tmp/mc_nx_wallpaper_db_" + std::to_string(generation) + "_" + std::to_string(source);
+
+    const std::string token = gWallpaperStatusToken;
+    const std::string dbUrl = wallpaperDbUrlForSource(source);
+    std::string command;
+    command += "rm -f " + shellQuote(token + ".b64") + " " + shellQuote(token + ".done") + "; ";
+    command += "( ";
+    command += "if command -v base64 >/dev/null 2>&1 && wget --no-check-certificate -q -O - " + shellQuote(dbUrl) + " | base64 > " + shellQuote(token + ".b64") + "; then ";
+    command += "if [ -s " + shellQuote(token + ".b64") + " ]; then echo OK > " + shellQuote(token + ".done") + "; else echo FAIL > " + shellQuote(token + ".done") + "; fi; ";
+    command += "else echo FAIL > " + shellQuote(token + ".done") + "; fi ";
+    command += ") >/dev/null 2>&1 &";
+
+    SshResult started = ssh.runCommand(command);
+    if (!started.success) {
+        gWallpaperStatusChecking = false;
+        cachedWallpaperStatus = {"STATUS: CHECK FAILED", "Unable to start DB check."};
+    }
+}
+
+void App::installWallpaperPack(const std::string& title, const std::string& dbUrl, const std::string& rawBase, const std::string& filterMode) {
+    (void)dbUrl;
+    (void)rawBase;
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+
+    std::vector<WallpaperDb::Entry> entries;
+    std::string error;
+    SshResult dbResult = ssh.runCommand("wget --no-check-certificate -q -O - " + shellQuote(wallpaperDbUrlForSource(selectedWallpaperSource)) + " | base64");
+    std::vector<unsigned char> zipData = dbResult.success ? decodeBase64Text(dbResult.output) : std::vector<unsigned char>();
+    if (!dbResult.success || !wallpaperEntriesFromZipBytes(selectedWallpaperSource, filterMode, zipData, entries, error)) {
+        if (error.empty()) error = dbResult.error.empty() ? "Unable to download wallpaper database." : dbResult.error;
+        showOutputWindow("INSTALL " + title, "Failed to read wallpaper database.\n\n" + error);
+        return;
+    }
+
+    showStreamingCommandWindow("INSTALL " + title, wallpaperInstallCommandFromEntries(entries), title + " installed.", title + " install failed.");
+    refreshWallpaperStatus();
+}
+
+void App::removeWallpaperPack(const std::string& title, const std::string& dbUrl, const std::string& rawBase, const std::string& filterMode) {
+    (void)dbUrl;
+    (void)rawBase;
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+    if (!confirm(("REMOVE " + title).c_str(), "REMOVE INSTALLED WALLPAPERS FROM THIS SOURCE?")) return;
+
+    std::vector<WallpaperDb::Entry> entries;
+    std::string error;
+    SshResult dbResult = ssh.runCommand("wget --no-check-certificate -q -O - " + shellQuote(wallpaperDbUrlForSource(selectedWallpaperSource)) + " | base64");
+    std::vector<unsigned char> zipData = dbResult.success ? decodeBase64Text(dbResult.output) : std::vector<unsigned char>();
+    if (!dbResult.success || !wallpaperEntriesFromZipBytes(selectedWallpaperSource, filterMode, zipData, entries, error)) {
+        if (error.empty()) error = dbResult.error.empty() ? "Unable to download wallpaper database." : dbResult.error;
+        showOutputWindow("REMOVE " + title, "Failed to read wallpaper database.\n\n" + error);
+        return;
+    }
+
+    showStreamingCommandWindow("REMOVE " + title, wallpaperRemoveCommandFromEntries(entries), title + " removed.", title + " remove failed.");
+    refreshWallpaperStatus();
+}
+
+void App::executeWallpaperAction(int actionIndex) {
+    std::vector<std::string> actions = wallpaperActions(selectedWallpaperSource);
+    if (actionIndex < 0 || actionIndex >= static_cast<int>(actions.size())) return;
+    const std::string action = actions[actionIndex];
+
+    switch (selectedWallpaperSource) {
+        case 0:
+            if (action == "INSTALL 16:9 WALLPAPERS" || action == "UPDATE 16:9 WALLPAPERS") installWallpaperPack("RANNY 16:9 WALLPAPERS", RannyDbUrl, RannyRawBase, "169");
+            else if (action == "INSTALL 4:3 WALLPAPERS" || action == "UPDATE 4:3 WALLPAPERS") installWallpaperPack("RANNY 4:3 WALLPAPERS", RannyDbUrl, RannyRawBase, "43");
+            else if (action == "REMOVE INSTALLED WALLPAPERS") removeWallpaperPack("RANNY WALLPAPERS", RannyDbUrl, RannyRawBase, "all");
+            break;
+        case 1:
+            if (action == "INSTALL WALLPAPERS" || action == "UPDATE WALLPAPERS") installWallpaperPack("PCN CHALLENGE WALLPAPERS", PcnDbUrl, PcnRawBase, "all");
+            else if (action == "REMOVE INSTALLED WALLPAPERS") removeWallpaperPack("PCN CHALLENGE WALLPAPERS", PcnDbUrl, PcnRawBase, "all");
+            break;
+        case 2:
+            if (action == "INSTALL WALLPAPERS" || action == "UPDATE WALLPAPERS") installWallpaperPack("PCN PREMIUM WALLPAPERS", PcnPremiumDbUrl, PcnPremiumRawBase, "all");
+            else if (action == "REMOVE INSTALLED WALLPAPERS") removeWallpaperPack("PCN PREMIUM WALLPAPERS", PcnPremiumDbUrl, PcnPremiumRawBase, "all");
+            break;
+        case 3:
+            if (action == "INSTALL WALLPAPERS" || action == "UPDATE WALLPAPERS") installWallpaperPack("ANIME0T4KU WALLPAPERS", Ot4kuDbUrl, Ot4kuRawBase, "all");
+            else if (action == "REMOVE INSTALLED WALLPAPERS") removeWallpaperPack("ANIME0T4KU WALLPAPERS", Ot4kuDbUrl, Ot4kuRawBase, "all");
+            break;
+    }
+}
+
+void App::handleWallpapersInput(u64 buttons) {
+    if (buttons & HidNpadButton_ZL) {
+        selectedWallpaperSource = (selectedWallpaperSource + WallpaperSourceCount - 1) % WallpaperSourceCount;
+        selectedWallpaperAction = 0;
+        refreshWallpaperStatus();
+        return;
+    }
+    if (buttons & HidNpadButton_ZR) {
+        selectedWallpaperSource = (selectedWallpaperSource + 1) % WallpaperSourceCount;
+        selectedWallpaperAction = 0;
+        refreshWallpaperStatus();
+        return;
+    }
+    if (buttons & HidNpadButton_Minus) {
+        showStaticWallpaperMenu();
+        refreshWallpaperStatus();
+        return;
+    }
+
+    std::vector<std::string> actions = wallpaperActions(selectedWallpaperSource);
+    const int actionCount = static_cast<int>(actions.size());
+    if (actionCount <= 0) {
+        selectedWallpaperAction = 0;
+        return;
+    }
+    if (selectedWallpaperAction >= actionCount) selectedWallpaperAction = actionCount - 1;
+
+    if (buttons & HidNpadButton_Up) selectedWallpaperAction = (selectedWallpaperAction + actionCount - 1) % actionCount;
+    if (buttons & HidNpadButton_Down) selectedWallpaperAction = (selectedWallpaperAction + 1) % actionCount;
+    if (!(buttons & HidNpadButton_A)) return;
+
+    if (!ssh.isConnected()) {
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+
+    executeWallpaperAction(selectedWallpaperAction);
+}
+
+
+struct PreviewImage {
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> rgba;
+    std::string status;
+};
+
+static unsigned int readBe32(const unsigned char* p) {
+    return (static_cast<unsigned int>(p[0]) << 24) |
+           (static_cast<unsigned int>(p[1]) << 16) |
+           (static_cast<unsigned int>(p[2]) << 8) |
+           static_cast<unsigned int>(p[3]);
+}
+
+static int pngChannelsForColorType(int colorType) {
+    switch (colorType) {
+        case 0: return 1;
+        case 2: return 3;
+        case 3: return 1;
+        case 4: return 2;
+        case 6: return 4;
+    }
+    return 0;
+}
+
+static unsigned char paethPredictor(unsigned char a, unsigned char b, unsigned char c) {
+    const int p = static_cast<int>(a) + static_cast<int>(b) - static_cast<int>(c);
+    const int pa = std::abs(p - static_cast<int>(a));
+    const int pb = std::abs(p - static_cast<int>(b));
+    const int pc = std::abs(p - static_cast<int>(c));
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+static unsigned char pngSample8(const unsigned char* data, int sampleIndex, int bitDepth) {
+    if (bitDepth == 16) return data[sampleIndex * 2];
+    return data[sampleIndex];
+}
+
+static bool decodePngRgba(const std::vector<unsigned char>& png, PreviewImage& out) {
+    static const unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (png.size() < 33 || std::memcmp(png.data(), signature, 8) != 0) {
+        out.status = "Not a PNG image.";
+        return false;
+    }
+
+    int width = 0;
+    int height = 0;
+    int bitDepth = 0;
+    int colorType = -1;
+    int interlace = 0;
+    std::vector<unsigned char> idat;
+    std::vector<unsigned char> palette;
+    std::vector<unsigned char> trns;
+
+    size_t pos = 8;
+    while (pos + 12 <= png.size()) {
+        const unsigned int len = readBe32(&png[pos]);
+        pos += 4;
+        if (pos + 4 + len + 4 > png.size()) {
+            out.status = "Invalid PNG chunk.";
+            return false;
+        }
+        std::string type(reinterpret_cast<const char*>(&png[pos]), 4);
+        pos += 4;
+        const unsigned char* data = &png[pos];
+
+        if (type == "IHDR") {
+            if (len < 13) {
+                out.status = "Invalid PNG header.";
+                return false;
+            }
+            width = static_cast<int>(readBe32(data));
+            height = static_cast<int>(readBe32(data + 4));
+            bitDepth = data[8];
+            colorType = data[9];
+            interlace = data[12];
+        } else if (type == "PLTE") {
+            palette.assign(data, data + len);
+        } else if (type == "tRNS") {
+            trns.assign(data, data + len);
+        } else if (type == "IDAT") {
+            idat.insert(idat.end(), data, data + len);
+        } else if (type == "IEND") {
+            break;
+        }
+        pos += len + 4;
+    }
+
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+        out.status = "Unsupported PNG size.";
+        return false;
+    }
+    if ((bitDepth != 8 && bitDepth != 16) || interlace != 0) {
+        out.status = "Unsupported PNG format.";
+        return false;
+    }
+
+    const int channels = pngChannelsForColorType(colorType);
+    if (channels <= 0 || idat.empty()) {
+        out.status = "Unsupported PNG color type.";
+        return false;
+    }
+
+    const int bytesPerSample = bitDepth == 16 ? 2 : 1;
+    const size_t stride = static_cast<size_t>(width) * static_cast<size_t>(channels) * static_cast<size_t>(bytesPerSample);
+    const size_t expected = (stride + 1) * static_cast<size_t>(height);
+    std::vector<unsigned char> inflated(expected);
+    uLongf destLen = static_cast<uLongf>(inflated.size());
+    int zrc = uncompress(inflated.data(), &destLen, idat.data(), static_cast<uLong>(idat.size()));
+    if (zrc != Z_OK || destLen < expected) {
+        out.status = "Unable to decompress PNG.";
+        return false;
+    }
+
+    std::vector<unsigned char> raw(stride * static_cast<size_t>(height));
+    const int bpp = channels * bytesPerSample;
+    size_t inPos = 0;
+    for (int y = 0; y < height; y++) {
+        const int filter = inflated[inPos++];
+        unsigned char* row = raw.data() + static_cast<size_t>(y) * stride;
+        const unsigned char* prev = y > 0 ? raw.data() + static_cast<size_t>(y - 1) * stride : nullptr;
+        for (size_t x = 0; x < stride; x++) {
+            const unsigned char value = inflated[inPos++];
+            const unsigned char left = x >= static_cast<size_t>(bpp) ? row[x - bpp] : 0;
+            const unsigned char up = prev ? prev[x] : 0;
+            const unsigned char upLeft = (prev && x >= static_cast<size_t>(bpp)) ? prev[x - bpp] : 0;
+            unsigned char recon = value;
+            switch (filter) {
+                case 0: recon = value; break;
+                case 1: recon = static_cast<unsigned char>(value + left); break;
+                case 2: recon = static_cast<unsigned char>(value + up); break;
+                case 3: recon = static_cast<unsigned char>(value + ((static_cast<int>(left) + static_cast<int>(up)) / 2)); break;
+                case 4: recon = static_cast<unsigned char>(value + paethPredictor(left, up, upLeft)); break;
+                default:
+                    out.status = "Unsupported PNG filter.";
+                    return false;
+            }
+            row[x] = recon;
+        }
+    }
+
+    out.width = width;
+    out.height = height;
+    out.rgba.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 255);
+
+    for (int y = 0; y < height; y++) {
+        const unsigned char* row = raw.data() + static_cast<size_t>(y) * stride;
+        for (int x = 0; x < width; x++) {
+            unsigned char* dst = out.rgba.data() + (static_cast<size_t>(y) * width + x) * 4;
+            if (colorType == 6) {
+                const unsigned char* src = row + static_cast<size_t>(x) * 4 * bytesPerSample;
+                dst[0] = pngSample8(src, 0, bitDepth);
+                dst[1] = pngSample8(src, 1, bitDepth);
+                dst[2] = pngSample8(src, 2, bitDepth);
+                dst[3] = pngSample8(src, 3, bitDepth);
+            } else if (colorType == 2) {
+                const unsigned char* src = row + static_cast<size_t>(x) * 3 * bytesPerSample;
+                dst[0] = pngSample8(src, 0, bitDepth);
+                dst[1] = pngSample8(src, 1, bitDepth);
+                dst[2] = pngSample8(src, 2, bitDepth);
+                dst[3] = 255;
+            } else if (colorType == 0) {
+                const unsigned char* src = row + static_cast<size_t>(x) * bytesPerSample;
+                const unsigned char v = pngSample8(src, 0, bitDepth);
+                dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+            } else if (colorType == 4) {
+                const unsigned char* src = row + static_cast<size_t>(x) * 2 * bytesPerSample;
+                const unsigned char v = pngSample8(src, 0, bitDepth);
+                dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = pngSample8(src, 1, bitDepth);
+            } else if (colorType == 3) {
+                const unsigned char idx = row[x];
+                const size_t pi = static_cast<size_t>(idx) * 3;
+                if (pi + 2 >= palette.size()) {
+                    dst[0] = dst[1] = dst[2] = 0;
+                    dst[3] = 255;
+                } else {
+                    dst[0] = palette[pi];
+                    dst[1] = palette[pi + 1];
+                    dst[2] = palette[pi + 2];
+                    dst[3] = idx < trns.size() ? trns[idx] : 255;
+                }
+            }
+        }
+    }
+
+    out.status = "Preview loaded.";
+    return true;
+}
+
+struct JpegErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf jump;
+    char message[JMSG_LENGTH_MAX];
+};
+
+static void jpegErrorExit(j_common_ptr cinfo) {
+    JpegErrorManager* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    if (err) {
+        (*cinfo->err->format_message)(cinfo, err->message);
+        longjmp(err->jump, 1);
+    }
+}
+
+static bool decodeJpegRgba(const std::vector<unsigned char>& jpg, PreviewImage& out) {
+    if (jpg.size() < 4 || jpg[0] != 0xFF || jpg[1] != 0xD8) {
+        out.status = "Not a JPEG image.";
+        return false;
+    }
+
+    jpeg_decompress_struct cinfo{};
+    JpegErrorManager jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.jump)) {
+        jpeg_destroy_decompress(&cinfo);
+        out.status = jerr.message[0] ? std::string(jerr.message) : "Unable to decode JPEG.";
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpg.data(), static_cast<unsigned long>(jpg.size()));
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        out.status = "Invalid JPEG header.";
+        return false;
+    }
+
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    const int width = static_cast<int>(cinfo.output_width);
+    const int height = static_cast<int>(cinfo.output_height);
+    const int comps = static_cast<int>(cinfo.output_components);
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096 || comps < 3) {
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        out.status = "Unsupported JPEG size.";
+        return false;
+    }
+
+    out.width = width;
+    out.height = height;
+    out.rgba.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 255);
+
+    std::vector<unsigned char> row(static_cast<size_t>(width) * static_cast<size_t>(comps));
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW rows[1] = { row.data() };
+        const unsigned int y = cinfo.output_scanline;
+        jpeg_read_scanlines(&cinfo, rows, 1);
+        unsigned char* dst = out.rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+        for (int x = 0; x < width; x++) {
+            const unsigned char* src = row.data() + static_cast<size_t>(x) * static_cast<size_t>(comps);
+            dst[x * 4 + 0] = src[0];
+            dst[x * 4 + 1] = src[1];
+            dst[x * 4 + 2] = src[2];
+            dst[x * 4 + 3] = 255;
+        }
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    out.status = "Preview loaded.";
+    return true;
+}
+
+void App::showStaticWallpaperMenu() {
+    if (!ssh.isConnected()) {
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+
+    auto loadWallpapers = [&]() -> std::vector<std::string> {
+        SshResult r = ssh.runCommand("find /media/fat/wallpapers -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \\) 2>/dev/null | sort");
+        std::vector<std::string> out;
+        if (!r.success) return out;
+        for (const std::string& line : splitLines(r.output)) {
+            std::string path = trim(line);
+            if (!path.empty()) out.push_back(path);
+        }
+        return out;
+    };
+
+    std::vector<std::string> wallpapers = loadWallpapers();
+    int selectedWallpaper = 0;
+    int scroll = 0;
+    std::string statusText = wallpapers.empty() ? "No wallpapers found." : "Select a wallpaper.";
+    std::string activePath = trim(runCommandMessage("cat /media/fat/Scripts/.config/static_wallpaper/selected_wallpaper.txt 2>/dev/null"));
+    PreviewImage preview;
+    std::string previewPath;
+    int pendingPreviewIndex = -1;
+    int previewDelayFrames = 0;
+
+    auto schedulePreview = [&](int index) {
+        if (index < 0 || index >= static_cast<int>(wallpapers.size())) return;
+        const std::string& remotePath = wallpapers[index];
+        if (remotePath.empty() || remotePath == previewPath || index == pendingPreviewIndex) return;
+        pendingPreviewIndex = index;
+        previewDelayFrames = 10;
+        preview = PreviewImage{};
+        preview.status = "Preview loading...";
+    };
+
+    auto loadPreview = [&](int index) {
+        if (index < 0 || index >= static_cast<int>(wallpapers.size())) return;
+        const std::string& remotePath = wallpapers[index];
+        if (remotePath.empty() || remotePath == previewPath) return;
+        previewPath = remotePath;
+        pendingPreviewIndex = -1;
+        preview = PreviewImage{};
+
+        const int remoteLine = index + 1;
+        const std::string encodedCommand =
+            "LINE=" + std::to_string(remoteLine) + "; "
+            "FOUND=$(find /media/fat/wallpapers -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \\) 2>/dev/null | sort | sed -n \"$LINE\"p); "
+            "if [ -n \"$FOUND\" ] && [ -f \"$FOUND\" ]; then base64 \"$FOUND\"; "
+            "else echo __MC_NX_PREVIEW_FILE_MISSING__; fi";
+
+        SshResult encodedResult = ssh.runCommand(encodedCommand);
+        if (!encodedResult.success) {
+            preview.status = encodedResult.error.empty() ? "Unable to read preview image." : encodedResult.error;
+            return;
+        }
+
+        if (encodedResult.output.find("__MC_NX_PREVIEW_FILE_MISSING__") != std::string::npos) {
+            preview.status = "Preview file was not found on MiSTer.";
+            return;
+        }
+
+        std::vector<unsigned char> bytes = decodeBase64Text(encodedResult.output);
+        if (bytes.empty()) {
+            preview.status = "Unable to decode preview image.";
+            return;
+        }
+
+        const bool isPng = bytes.size() >= 8 &&
+            bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e && bytes[3] == 0x47 &&
+            bytes[4] == 0x0d && bytes[5] == 0x0a && bytes[6] == 0x1a && bytes[7] == 0x0a;
+        const bool isJpg = bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
+
+        if (isPng) decodePngRgba(bytes, preview);
+        else if (isJpg) decodeJpegRgba(bytes, preview);
+        else preview.status = "Unsupported preview format.";
+    };
+
+    if (!wallpapers.empty()) schedulePreview(selectedWallpaper);
+
+    bool inputReleased = false;
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    while (appletMainLoop()) {
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.fillRect(0, 0, UiRenderer::Width, 92, UiRenderer::rgb(20, 16, 34));
+        ui.fillRect(0, 90, UiRenderer::Width, 4, UiRenderer::rgb(143, 84, 255));
+        ui.drawText(42, 30, "STATIC WALLPAPER", UiRenderer::rgb(248, 245, 255), 3);
+        ui.drawStatusPill(UiRenderer::Width - 280, 28, ssh.isConnected() ? "CONNECTED" : "DISCONNECTED", ssh.isConnected());
+
+        ui.drawCard(40, 124, 520, 500, "WALLPAPERS");
+        ui.drawCard(590, 124, 650, 500, "PREVIEW");
+
+        const int visible = 8;
+        if (selectedWallpaper < scroll) scroll = selectedWallpaper;
+        if (selectedWallpaper >= scroll + visible) scroll = selectedWallpaper - visible + 1;
+        if (scroll < 0) scroll = 0;
+        if (scroll > std::max(0, static_cast<int>(wallpapers.size()) - visible)) scroll = std::max(0, static_cast<int>(wallpapers.size()) - visible);
+
+        int y = 186;
+        for (int i = scroll; i < static_cast<int>(wallpapers.size()) && i < scroll + visible; i++) {
+            std::string name = wallpapers[i];
+            size_t slash = name.find_last_of('/');
+            if (slash != std::string::npos) name = name.substr(slash + 1);
+            const bool active = i == selectedWallpaper;
+            const bool isApplied = wallpapers[i] == activePath;
+            ui.drawButton(76, y, 448, 46, (isApplied ? "* " : "  ") + ellipsizeText(name, 32), active, false, false);
+            y += 54;
+        }
+
+        if (!wallpapers.empty()) {
+            std::string selectedPath = wallpapers[selectedWallpaper];
+            std::string selectedName = selectedPath;
+            size_t slash = selectedName.find_last_of('/');
+            if (slash != std::string::npos) selectedName = selectedName.substr(slash + 1);
+            ui.drawText(626, 198, "SELECTED", UiRenderer::rgb(174, 154, 218), 2);
+            ui.drawText(626, 236, ellipsizeText(selectedName, 46), UiRenderer::rgb(248, 245, 255), 2);
+            ui.drawText(626, 300, "PREVIEW", UiRenderer::rgb(174, 154, 218), 2);
+            ui.fillRect(626, 338, 578, 210, UiRenderer::rgb(20, 16, 34));
+            ui.drawRect(626, 338, 578, 210, UiRenderer::rgb(67, 57, 92), 2);
+            if (!preview.rgba.empty() && preview.width > 0 && preview.height > 0) {
+                ui.drawImageRgba(626, 338, 578, 210, preview.rgba.data(), preview.width, preview.height);
+            } else {
+                ui.drawTextCentered(626, 424, 578, ellipsizeText(preview.status.empty() ? "NO PREVIEW" : preview.status, 45), UiRenderer::rgb(174, 154, 218), 2);
+            }
+            ui.drawText(626, 570, ellipsizeText(selectedPath == activePath ? "CURRENT STATIC WALLPAPER" : statusText, 48), selectedPath == activePath ? UiRenderer::rgb(112, 232, 165) : UiRenderer::rgb(218, 208, 238), 2);
+        } else {
+            ui.drawText(76, 206, "NO WALLPAPERS FOUND", UiRenderer::rgb(232, 190, 120), 3);
+            ui.drawText(626, 240, "INSTALL WALLPAPERS FIRST.", UiRenderer::rgb(218, 208, 238), 2);
+        }
+
+        ui.drawFooter("UP/DOWN SELECT    A/X APPLY    Y REMOVE STATIC    B/- BACK");
+        ui.endFrame();
+
+        padUpdate(&pad);
+        const u64 held = padGetButtons(&pad);
+        const u64 buttons = padGetButtonsDown(&pad);
+        if (!inputReleased) {
+            if ((held & HidNpadButton_Minus) == 0) inputReleased = true;
+            continue;
+        }
+
+        if (buttons & (HidNpadButton_Minus | HidNpadButton_B)) return;
+        if (!wallpapers.empty() && (buttons & HidNpadButton_Up)) {
+            selectedWallpaper = (selectedWallpaper + static_cast<int>(wallpapers.size()) - 1) % static_cast<int>(wallpapers.size());
+            schedulePreview(selectedWallpaper);
+        }
+        if (!wallpapers.empty() && (buttons & HidNpadButton_Down)) {
+            selectedWallpaper = (selectedWallpaper + 1) % static_cast<int>(wallpapers.size());
+            schedulePreview(selectedWallpaper);
+        }
+
+        if (pendingPreviewIndex >= 0 && (held & (HidNpadButton_Up | HidNpadButton_Down)) == 0) {
+            if (previewDelayFrames > 0) previewDelayFrames--;
+            if (previewDelayFrames <= 0) loadPreview(pendingPreviewIndex);
+        }
+
+        if (!wallpapers.empty() && (buttons & (HidNpadButton_X | HidNpadButton_A))) {
+            std::string selectedPath = wallpapers[selectedWallpaper];
+            std::string selectedName = selectedPath;
+            size_t selectedSlash = selectedName.find_last_of('/');
+            if (selectedSlash != std::string::npos) selectedName = selectedName.substr(selectedSlash + 1);
+            std::string ext = toLower(selectedName.substr(selectedName.find_last_of('.') == std::string::npos ? selectedName.size() : selectedName.find_last_of('.')));
+            std::string target = (ext == ".png") ? StaticWallpaperTargetPng : StaticWallpaperTargetJpg;
+            std::string other = (ext == ".png") ? StaticWallpaperTargetJpg : StaticWallpaperTargetPng;
+            const int remoteLine = selectedWallpaper + 1;
+            std::string command =
+                "LINE=" + std::to_string(remoteLine) + "; "
+                "SELECTED=$(find /media/fat/wallpapers -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \\) 2>/dev/null | sort | sed -n \"$LINE\"p); "
+                "if [ -z \"$SELECTED\" ] || [ ! -f \"$SELECTED\" ]; then echo 'Selected wallpaper was not found.'; exit 1; fi; "
+                "mkdir -p " + std::string(StaticWallpaperConfigDir) + " && "
+                "rm -f " + shellQuote(other) + " && "
+                "cp \"$SELECTED\" " + shellQuote(target) + " && "
+                "rm -f " + shellQuote(other) + " && "
+                "printf %s \"$SELECTED\" > " + shellQuote(StaticWallpaperConfigPath) + " && "
+                "sync && " + std::string(MisterMenuReloadCommand);
+            SshResult result = ssh.runCommand(command);
+            if (result.success) {
+                activePath = selectedPath;
+                statusText = "Static wallpaper applied. MiSTer menu reloaded.";
+            } else {
+                statusText = result.error.empty() ? "Unable to apply static wallpaper." : result.error;
+            }
+        }
+        if (buttons & HidNpadButton_Y) {
+            if (confirm("REMOVE STATIC WALLPAPER", "REMOVE CURRENT STATIC WALLPAPER?")) {
+                SshResult result = ssh.runCommand("rm -f /media/fat/menu.jpg /media/fat/menu.png; sync; " + std::string(MisterMenuReloadCommand));
+                if (result.success) {
+                    activePath.clear();
+                    statusText = "Static wallpaper removed. MiSTer menu reloaded.";
+                } else {
+                    statusText = result.error.empty() ? "Unable to remove static wallpaper." : result.error;
+                }
+            }
+        }
+    }
+}
+
+void App::handleExtrasInput(u64 buttons) {
+    if (buttons & HidNpadButton_ZL) {
+        selectedExtra = (selectedExtra + ExtraCount - 1) % ExtraCount;
+        selected = 0;
+        refreshCurrentExtraStatus(false);
+        return;
+    }
+    if (buttons & HidNpadButton_ZR) {
+        selectedExtra = (selectedExtra + 1) % ExtraCount;
+        selected = 0;
+        refreshCurrentExtraStatus(false);
+        return;
+    }
+
+    std::vector<std::string> actions = extraActions(static_cast<ExtraId>(selectedExtra));
+    if (actions.empty()) return;
+
+    if (buttons & HidNpadButton_Up) selected = (selected + static_cast<int>(actions.size()) - 1) % static_cast<int>(actions.size());
+    if (buttons & HidNpadButton_Down) selected = (selected + 1) % static_cast<int>(actions.size());
+    if (!(buttons & HidNpadButton_A)) return;
+
+    if (!ssh.isConnected()) {
+        lastMessage = "Connect to a MiSTer first.";
+        return;
+    }
+
+    executeExtraAction(static_cast<ExtraId>(selectedExtra), selected);
+}
+
 
 void App::handleSettingsInput(u64 buttons) {
     if (!ssh.isConnected()) {
@@ -748,6 +2069,593 @@ void App::cycleSettingsValue(int index) {
     }
     settingsDirty = true;
 }
+std::string App::extraTitle(ExtraId id) const {
+    switch (id) {
+        case ExtraId::ZaparooFrontend: return "ZAPAROO FRONTEND";
+        case ExtraId::RetroAchievementCores: return "RETROACHIEVEMENT CORES";
+    }
+    return "EXTRA";
+}
+
+static bool extraStatusInstalled(const std::vector<std::string>& lines) {
+    return statusValue(lines, "INSTALLED") == "YES";
+}
+
+std::vector<std::string> App::extraActions(ExtraId id) const {
+    std::vector<std::string> statusLines = selectedExtra >= 0 && selectedExtra < static_cast<int>(cachedExtraStatus.size())
+        ? cachedExtraStatus[selectedExtra]
+        : std::vector<std::string>{};
+    const bool installed = extraStatusInstalled(statusLines);
+    const bool updateAvailable = extraUpdateAvailable[static_cast<int>(id)];
+
+    std::vector<std::string> actions;
+    if (extraUpdateCheckPending && extraUpdateCheckIndex == static_cast<int>(id)) {
+        return actions;
+    }
+    if (!installed) {
+        actions.push_back("INSTALL");
+        return actions;
+    }
+
+    actions.push_back("CHECK FOR UPDATES");
+    if (updateAvailable) actions.push_back("UPDATE");
+    if (id == ExtraId::RetroAchievementCores) actions.push_back("CONFIGURE");
+    actions.push_back("UNINSTALL");
+    return actions;
+}
+
+static std::string raSourcesHeredoc();
+
+std::vector<std::string> App::extraStatus(ExtraId id) {
+    if (!ssh.isConnected()) {
+        if (id == ExtraId::ZaparooFrontend) return {"INSTALLED: NO", "VERSION: UNKNOWN"};
+        return {"INSTALLED: NO"};
+    }
+
+    if (id == ExtraId::ZaparooFrontend) {
+        const std::string command =
+            "INSTALLED=NO; "
+            "if [ -f /media/fat/zaparoo/MiSTer_Zaparoo ] && [ -f /media/fat/zaparoo/frontend ] && [ -f /media/fat/zaparoo/menu_zaparoo.rbf ] && grep -q 'main=zaparoo/MiSTer_Zaparoo' /media/fat/MiSTer.ini 2>/dev/null; then INSTALLED=YES; fi; "
+            "VERSION=$(cat /media/fat/Scripts/.config/zaparoo_frontend/version.txt 2>/dev/null); "
+            "[ -z \"$VERSION\" ] && VERSION=$(cat /media/fat/Scripts/.config/zaparoo_launcher/version.txt 2>/dev/null); "
+            "[ -z \"$VERSION\" ] && VERSION=UNKNOWN; "
+            "echo INSTALLED: $INSTALLED; echo VERSION: $VERSION";
+        return splitLines(runCommandMessage(command));
+    }
+
+    const std::string command =
+        "INSTALLED=NO; "
+        "if [ -f /media/fat/MiSTer_RA ] && [ -f /media/fat/achievement.wav ] && [ -f /media/fat/retroachievements.cfg ] && [ -d /media/fat/_RA_Cores/Cores ] && [ -d /media/fat/_RA_Cores ] && grep -q '^main=MiSTer_RA' /media/fat/MiSTer.ini 2>/dev/null; then INSTALLED=YES; fi; "
+        "echo INSTALLED: $INSTALLED";
+    return splitLines(runCommandMessage(command));
+}
+
+void App::refreshCurrentExtraStatus(bool checkLatest) {
+    if (cachedExtraStatus.empty()) cachedExtraStatus.assign(ExtraCount, std::vector<std::string>{"STATUS: NOT CHECKED"});
+    if (selectedExtra < 0 || selectedExtra >= ExtraCount) selectedExtra = 0;
+
+    ExtraId id = static_cast<ExtraId>(selectedExtra);
+    cachedExtraStatus[selectedExtra] = extraStatus(id);
+
+    if (!checkLatest) return;
+
+    if (!ssh.isConnected() || !extraStatusInstalled(cachedExtraStatus[selectedExtra])) {
+        lastMessage = "Install this extra before checking for updates.";
+        return;
+    }
+
+    extraUpdateAvailable[selectedExtra] = false;
+    extraLatestVersion[selectedExtra].clear();
+    cachedExtraStatus[selectedExtra].push_back("STATUS: CHECKING FOR UPDATES...");
+    cachedExtraStatus[selectedExtra].push_back("UPDATES AVAILABLE: CHECKING");
+    extraUpdateCheckPending = true;
+    extraUpdateCheckIndex = selectedExtra;
+    lastMessage = "Checking for updates...";
+}
+
+void App::performPendingExtraUpdateCheck() {
+    if (!extraUpdateCheckPending) return;
+
+    const int source = extraUpdateCheckIndex;
+    extraUpdateCheckPending = false;
+    extraUpdateCheckIndex = -1;
+
+    if (source < 0 || source >= ExtraCount) return;
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+
+    ExtraId id = static_cast<ExtraId>(source);
+    std::vector<std::string> baseLines = extraStatus(id);
+    if (!extraStatusInstalled(baseLines)) {
+        cachedExtraStatus[source] = baseLines;
+        extraUpdateAvailable[source] = false;
+        lastMessage = "Install this extra before checking for updates.";
+        return;
+    }
+
+    int updateCount = 0;
+    bool checkFailed = false;
+
+    if (id == ExtraId::ZaparooFrontend) {
+        const std::string checkCommand = R"SH(
+latest_from_repo() {
+    repo="$1"
+    latest=$(wget --no-check-certificate --server-response --spider "https://github.com/$repo/releases/latest" 2>&1 | sed -n 's/.*[Ll]ocation: .*\/releases\/tag\/\([^?\r]*\).*/\1/p' | tail -1)
+    if [ -z "$latest" ]; then
+        json=/tmp/mc_latest_release_$$.json
+        wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$json" "https://api.github.com/repos/$repo/releases/latest" >/dev/null 2>&1
+        latest=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json" | head -1)
+        rm -f "$json"
+    fi
+    printf '%s' "$latest"
+}
+installed=$(cat /media/fat/Scripts/.config/zaparoo_frontend/version.txt 2>/dev/null)
+[ -z "$installed" ] && installed=$(cat /media/fat/Scripts/.config/zaparoo_launcher/version.txt 2>/dev/null)
+latest=$(latest_from_repo ZaparooProject/zaparoo-frontend)
+echo "MC_ZAP_INSTALLED:$installed"
+echo "MC_ZAP_LATEST:$latest"
+)SH";
+        std::vector<std::string> checkLines = splitLines(runCommandMessage(checkCommand));
+        std::string installed = normalizeExtraVersion(statusValue(checkLines, "MC_ZAP_INSTALLED"));
+        std::string latest = normalizeExtraVersion(statusValue(checkLines, "MC_ZAP_LATEST"));
+
+        if (latest.empty()) {
+            checkFailed = true;
+        } else if (!installed.empty() && installed != latest) {
+            updateCount = 1;
+        }
+    } else {
+        std::string checkCommand;
+        checkCommand += R"SH(
+TMP=/tmp/mc_ra_update_check_$$
+rm -rf "$TMP"
+mkdir -p "$TMP"
+cat > "$TMP/sources.txt" <<'MCRASOURCES'
+)SH";
+        checkCommand += raSourcesHeredoc();
+        checkCommand += R"SH(MCRASOURCES
+latest_from_repo() {
+    repo="$1"
+    latest=$(wget --no-check-certificate --server-response --spider "https://github.com/$repo/releases/latest" 2>&1 | sed -n 's/.*[Ll]ocation: .*\/releases\/tag\/\([^?\r]*\).*/\1/p' | tail -1)
+    if [ -z "$latest" ]; then
+        json="$TMP/latest.json"
+        wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$json" "https://api.github.com/repos/$repo/releases/latest" >/dev/null 2>&1
+        latest=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json" | head -1)
+        rm -f "$json"
+    fi
+    printf '%s' "$latest"
+}
+echo MC_RA_INSTALLED_BEGIN
+if [ -f /media/fat/Scripts/.config/ra_cores/versions.json ]; then
+    cat /media/fat/Scripts/.config/ra_cores/versions.json
+fi
+echo
+echo MC_RA_INSTALLED_END
+echo MC_RA_LATEST_BEGIN
+while IFS='|' read -r key title repo kind; do
+    [ -z "$key" ] && continue
+    latest=$(latest_from_repo "$repo")
+    echo "MC_LATEST|$key|$title|$repo|$latest"
+done < "$TMP/sources.txt"
+echo MC_RA_LATEST_END
+rm -rf "$TMP"
+)SH";
+
+        std::vector<std::string> checkLines = splitLines(runCommandMessage(checkCommand));
+        std::string installedJson;
+        bool inInstalled = false;
+        int latestSeen = 0;
+        int latestResolved = 0;
+        int parsedInstalled = 0;
+
+        for (const std::string& line : checkLines) {
+            if (line == "MC_RA_INSTALLED_BEGIN") {
+                inInstalled = true;
+                continue;
+            }
+            if (line == "MC_RA_INSTALLED_END") {
+                inInstalled = false;
+                continue;
+            }
+            if (inInstalled) {
+                installedJson += line;
+                installedJson += '\n';
+            }
+        }
+
+        for (const std::string& line : checkLines) {
+            if (line.rfind("MC_LATEST|", 0) != 0) continue;
+            std::vector<std::string> parts = splitByChar(line, '|');
+            if (parts.size() < 5) continue;
+
+            const std::string key = parts[1];
+            const std::string title = parts[2];
+            const std::string repo = parts[3];
+            const std::string latest = normalizeExtraVersion(parts[4]);
+            latestSeen++;
+            if (latest.empty()) continue;
+            latestResolved++;
+
+            std::string installed = normalizeExtraVersion(installedRaVersionForSource(installedJson, key, title, repo));
+            if (installed.empty()) continue;
+            parsedInstalled++;
+
+            if (installed != latest) updateCount++;
+        }
+
+        if (latestSeen == 0 || latestResolved == 0) {
+            checkFailed = true;
+        } else if (parsedInstalled == 0) {
+            updateCount = 0;
+        }
+    }
+
+    baseLines.push_back("UPDATES AVAILABLE: " + (checkFailed ? std::string("UNKNOWN") : std::to_string(updateCount)));
+    baseLines.push_back(std::string("UPDATE: ") + (!checkFailed && updateCount > 0 ? "YES" : "NO"));
+    cachedExtraStatus[source] = baseLines;
+    extraLatestVersion[source].clear();
+    extraUpdateAvailable[source] = !checkFailed && updateCount > 0;
+    lastMessage = checkFailed
+        ? "Update check failed."
+        : (updateCount > 0
+            ? ("Update check complete. " + std::to_string(updateCount) + " update(s) available.")
+            : "Update check complete. No updates available.");
+}
+
+static std::string zaparooFrontendInstallShell() {
+    return R"SH(
+set -u
+TMP=/tmp/mc_zaparoo_frontend
+rm -rf "$TMP"
+mkdir -p "$TMP" /media/fat/zaparoo /media/fat/Scripts/.config/zaparoo_frontend
+echo Finding latest Zaparoo Frontend release...
+wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$TMP/release.json" "https://api.github.com/repos/ZaparooProject/zaparoo-frontend/releases/latest" || exit 1
+TAG=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/release.json" | head -1)
+if [ -z "$TAG" ]; then echo Unable to determine latest Zaparoo Frontend version.; exit 1; fi
+echo Latest version: $TAG
+echo Finding release ZIP...
+URL=$(sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\.zip\)".*/\1/p' "$TMP/release.json" | head -1)
+if [ -z "$URL" ]; then echo Unable to find ZIP asset.; exit 1; fi
+echo Downloading package...
+wget --no-check-certificate -O "$TMP/frontend.zip" "$URL" || exit 1
+if [ ! -s "$TMP/frontend.zip" ]; then echo Downloaded ZIP is empty.; exit 1; fi
+echo Extracting package...
+unzip -o "$TMP/frontend.zip" -d "$TMP/extract" >/dev/null || exit 1
+MAIN=$(find "$TMP/extract" -path '*/zaparoo/MiSTer_Zaparoo' -o -name MiSTer_Zaparoo | head -1)
+FRONTEND=$(find "$TMP/extract" -path '*/zaparoo/frontend' -o -name frontend | head -1)
+MENU=$(find "$TMP/extract" -path '*/zaparoo/menu_zaparoo.rbf' -o -name menu_zaparoo.rbf | head -1)
+if [ -z "$MAIN" ] || [ -z "$FRONTEND" ] || [ -z "$MENU" ]; then echo Required Zaparoo Frontend files missing from ZIP.; exit 1; fi
+echo Removing old frontend files...
+rm -f /media/fat/zaparoo/MiSTer_Zaparoo /media/fat/zaparoo/frontend /media/fat/zaparoo/launcher /media/fat/zaparoo/menu_zaparoo.rbf
+cp "$MAIN" /media/fat/zaparoo/MiSTer_Zaparoo || exit 1
+cp "$FRONTEND" /media/fat/zaparoo/frontend || exit 1
+cp "$MENU" /media/fat/zaparoo/menu_zaparoo.rbf || exit 1
+chmod +x /media/fat/zaparoo/MiSTer_Zaparoo /media/fat/zaparoo/frontend
+if [ ! -f /media/fat/MiSTer.ini ]; then
+    wget --no-check-certificate -O /media/fat/MiSTer.ini https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/assets/MiSTer_example.ini || true
+fi
+if ! grep -q '^main=zaparoo/MiSTer_Zaparoo' /media/fat/MiSTer.ini 2>/dev/null; then
+    if grep -q '^\[MiSTer\]' /media/fat/MiSTer.ini 2>/dev/null; then
+        awk 'BEGIN{done=0} /^\[MiSTer\]/{print; print "main=zaparoo/MiSTer_Zaparoo"; done=1; next} {print} END{if(done==0){print "[MiSTer]"; print "main=zaparoo/MiSTer_Zaparoo"}}' /media/fat/MiSTer.ini > "$TMP/MiSTer.ini" && mv "$TMP/MiSTer.ini" /media/fat/MiSTer.ini
+    else
+        printf '[MiSTer]\nmain=zaparoo/MiSTer_Zaparoo\n\n' | cat - /media/fat/MiSTer.ini > "$TMP/MiSTer.ini" && mv "$TMP/MiSTer.ini" /media/fat/MiSTer.ini
+    fi
+fi
+printf '%s\n' "$TAG" > /media/fat/Scripts/.config/zaparoo_frontend/version.txt
+rm -rf "$TMP"
+sync
+echo Zaparoo Frontend installed.
+echo A MiSTer menu reload is recommended.
+)SH";
+}
+
+void App::installOrUpdateZaparooFrontend() {
+    const bool success = showStreamingCommandWindow("ZAPAROO FRONTEND", zaparooFrontendInstallShell(), "Zaparoo Frontend installed.", "Zaparoo Frontend install failed.");
+    if (success) {
+        extraUpdateAvailable[static_cast<int>(ExtraId::ZaparooFrontend)] = false;
+        sendSoftRebootCommand();
+    }
+    refreshCurrentExtraStatus(false);
+}
+
+void App::uninstallZaparooFrontend() {
+    if (!confirm("UNINSTALL ZAPAROO FRONTEND", "ARE YOU SURE?")) return;
+    const std::string command = R"SH(
+echo Removing Zaparoo Frontend files...
+rm -f /media/fat/zaparoo/MiSTer_Zaparoo /media/fat/zaparoo/frontend /media/fat/zaparoo/launcher /media/fat/zaparoo/menu_zaparoo.rbf
+rm -f /media/fat/Scripts/.config/zaparoo_frontend/version.txt /media/fat/Scripts/.config/zaparoo_launcher/version.txt
+if [ -f /media/fat/MiSTer.ini ]; then
+    grep -v '^main=zaparoo/MiSTer_Zaparoo$' /media/fat/MiSTer.ini | grep -v '^alt_launcher=zaparoo/launcher$' > /tmp/mc_mister_ini_zap && mv /tmp/mc_mister_ini_zap /media/fat/MiSTer.ini
+fi
+sync
+echo Zaparoo Frontend uninstalled.
+)SH";
+    const bool success = showStreamingCommandWindow("UNINSTALL ZAPAROO FRONTEND", command, "Zaparoo Frontend uninstalled.", "Zaparoo Frontend uninstall failed.");
+    extraUpdateAvailable[static_cast<int>(ExtraId::ZaparooFrontend)] = false;
+    if (success) {
+        sendSoftRebootCommand();
+        waitForReconnectAfterReboot("ZAPAROO FRONTEND", "Soft reboot command sent. Waiting for MiSTer...");
+    }
+    refreshCurrentExtraStatus(false);
+}
+
+static std::string raSourcesHeredoc() {
+    return R"RA(main|Main_MiSTer|odelot/Main_MiSTer|main_zip
+nes|NES|odelot/NES_MiSTer|rbf
+snes|SNES|odelot/SNES_MiSTer|rbf
+gameboy|Gameboy|odelot/Gameboy_MiSTer|rbf
+gba|GBA|odelot/GBA_MiSTer|rbf
+n64|N64|odelot/N64_MiSTer|rbf
+psx|PSX|odelot/PSX_MiSTer|rbf
+megadrive|MegaDrive|odelot/MegaDrive_MiSTer|rbf
+megacd|MegaCD|odelot/MegaCD_MiSTer|rbf
+sms|SMS|odelot/SMS_MiSTer|rbf
+neogeo|NeoGeo|odelot/NeoGeo_MiSTer|rbf
+turbografx16|TurboGrafx16|odelot/TurboGrafx16_MiSTer|rbf
+atari7800|Atari7800|odelot/Atari7800_MiSTer|rbf
+s32x|S32X|odelot/S32X_MiSTer|rbf
+)RA";
+}
+
+static std::string raCoresInstallShell(bool updateOnly) {
+    std::string command;
+    command += "TMP=/tmp/mc_ra_cores\nrm -rf \"$TMP\"\nmkdir -p \"$TMP\" /media/fat/_RA_Cores/Cores /media/fat/Scripts/.config/ra_cores\n";
+    command += "cat > \"$TMP/sources.txt\" <<'MCRASOURCES'\n" + raSourcesHeredoc() + "MCRASOURCES\n";
+    command += updateOnly ? "echo Checking for RetroAchievement Cores updates...\n" : "echo Installing RetroAchievement Cores...\n";
+    command += R"SH(
+INSTALLED=NO
+if [ -f /media/fat/MiSTer_RA ] && [ -f /media/fat/achievement.wav ] && [ -d /media/fat/_RA_Cores/Cores ]; then INSTALLED=YES; fi
+printf '{\n  "sources": {\n' > "$TMP/versions.json"
+FIRST=1
+while IFS='|' read -r key title repo kind; do
+    [ -z "$key" ] && continue
+    release_json="$TMP/${key}_release.json"
+    wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$release_json" "https://api.github.com/repos/$repo/releases/latest" || exit 1
+    latest=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$release_json" | head -1)
+    if [ -z "$latest" ]; then echo "Unable to determine latest $title release."; exit 1; fi
+    installed=
+    if [ -f /media/fat/Scripts/.config/ra_cores/versions.json ]; then
+        flat_versions=$(tr -d '\n\r\t ' < /media/fat/Scripts/.config/ra_cores/versions.json)
+        installed=$(printf '%s' "$flat_versions" | sed -n 's/.*"'"$key"'":{"version":"\([^"]*\)".*/\1/p')
+        [ -z "$installed" ] && installed=$(printf '%s' "$flat_versions" | sed -n 's/.*"'"$key"'":{[^}]*"version":"\([^"]*\)".*/\1/p')
+        [ -z "$installed" ] && installed=$(printf '%s' "$flat_versions" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p')
+    fi
+    if [ "$INSTALLED" = "YES" ] && [ "$installed" = "$latest" ]; then
+        echo "$title is already up to date, skipping download."
+        if [ "$FIRST" = 0 ]; then printf ',\n' >> "$TMP/versions.json"; fi
+        FIRST=0
+        if [ "$key" = "main" ]; then
+            printf '    "%s": {"asset": "", "files": ["/media/fat/MiSTer_RA", "/media/fat/achievement.wav", "/media/fat/retroachievements.cfg"], "version": "%s"}' "$key" "$latest" >> "$TMP/versions.json"
+        else
+            printf '    "%s": {"asset": "", "files": ["/media/fat/_RA_Cores/Cores/%s.rbf", "/media/fat/_RA_Cores/%s.mgl"], "version": "%s"}' "$key" "$title" "$title" "$latest" >> "$TMP/versions.json"
+        fi
+        continue
+    fi
+    echo "Downloading $title $latest..."
+    URL=$(sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\.zip\)".*/\1/p' "$release_json" | head -1)
+    if [ -z "$URL" ]; then URL=$(sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\.rbf\)".*/\1/p' "$release_json" | head -1); fi
+    if [ -z "$URL" ]; then echo "Unable to find asset for $title."; exit 1; fi
+    OUT="$TMP/$key.asset"
+    wget --no-check-certificate -O "$OUT" "$URL" || exit 1
+    if [ "$kind" = "main_zip" ]; then
+        rm -rf "$TMP/main_extract" && mkdir -p "$TMP/main_extract"
+        unzip -o "$OUT" -d "$TMP/main_extract" >/dev/null || exit 1
+        MAIN=$(find "$TMP/main_extract" -name MiSTer | head -1)
+        CFG=$(find "$TMP/main_extract" -name retroachievements.cfg | head -1)
+        WAV=$(find "$TMP/main_extract" -name achievement.wav | head -1)
+        [ -z "$MAIN" ] && echo "Main_MiSTer binary missing." && exit 1
+        cp "$MAIN" /media/fat/MiSTer_RA || exit 1
+        chmod +x /media/fat/MiSTer_RA
+        [ -n "$WAV" ] && cp "$WAV" /media/fat/achievement.wav
+        if [ -n "$CFG" ] && [ ! -f /media/fat/retroachievements.cfg ]; then cp "$CFG" /media/fat/retroachievements.cfg; fi
+    else
+        if echo "$URL" | grep -qi '\.zip$'; then
+            rm -rf "$TMP/core_extract" && mkdir -p "$TMP/core_extract"
+            unzip -o "$OUT" -d "$TMP/core_extract" >/dev/null || exit 1
+            RBF=$(find "$TMP/core_extract" -name '*.rbf' | head -1)
+        else
+            RBF="$OUT"
+        fi
+        [ -z "$RBF" ] && echo "RBF missing for $title." && exit 1
+        cp "$RBF" "/media/fat/_RA_Cores/Cores/$title.rbf" || exit 1
+        cat > "/media/fat/_RA_Cores/$title.mgl" <<EOFRA
+<mistergamedescription>
+    <rbf>_RA_Cores/Cores/$title.rbf</rbf>
+</mistergamedescription>
+EOFRA
+    fi
+    if [ "$FIRST" = 0 ]; then printf ',\n' >> "$TMP/versions.json"; fi
+    FIRST=0
+    asset_name=$(basename "$URL")
+    if [ "$kind" = "main_zip" ]; then
+        printf '    "%s": {"asset": "%s", "files": ["/media/fat/MiSTer_RA", "/media/fat/achievement.wav", "/media/fat/retroachievements.cfg"], "version": "%s"}' "$key" "$asset_name" "$latest" >> "$TMP/versions.json"
+    else
+        printf '    "%s": {"asset": "%s", "files": ["/media/fat/_RA_Cores/Cores/%s.rbf", "/media/fat/_RA_Cores/%s.mgl"], "version": "%s"}' "$key" "$asset_name" "$title" "$title" "$latest" >> "$TMP/versions.json"
+    fi
+done < "$TMP/sources.txt"
+printf '\n  }\n}\n' >> "$TMP/versions.json"
+cp "$TMP/versions.json" /media/fat/Scripts/.config/ra_cores/versions.json
+if [ ! -f /media/fat/MiSTer.ini ]; then
+    if [ -f /media/fat/MiSTer_Example.ini ]; then cp /media/fat/MiSTer_Example.ini /media/fat/MiSTer.ini; else wget --no-check-certificate -O /media/fat/MiSTer.ini https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/assets/MiSTer_example.ini || true; fi
+fi
+if ! grep -q '^\[RA_\*\]' /media/fat/MiSTer.ini 2>/dev/null; then
+    printf '\n[RA_*]\nmain=MiSTer_RA\n' >> /media/fat/MiSTer.ini
+fi
+rm -f /media/fat/MiSTer_RA.ini
+rm -rf "/media/fat/_RA Cores"
+rm -rf "$TMP"
+sync
+echo RetroAchievement Cores install/update complete.
+)SH";
+    return command;
+}
+
+void App::installOrUpdateRaCores(bool updateOnly) {
+    showStreamingCommandWindow(updateOnly ? "UPDATE RA CORES" : "INSTALL RA CORES", raCoresInstallShell(updateOnly), updateOnly ? "RetroAchievement Cores updated." : "RetroAchievement Cores installed.", "RetroAchievement Cores operation failed.");
+    extraUpdateAvailable[static_cast<int>(ExtraId::RetroAchievementCores)] = false;
+    refreshCurrentExtraStatus(false);
+}
+
+void App::uninstallRaCores() {
+    if (!confirm("UNINSTALL RA CORES", "ARE YOU SURE?")) return;
+    const std::string command = R"SH(
+echo Removing RetroAchievement Cores files...
+rm -f /media/fat/MiSTer_RA /media/fat/MiSTer_RA.ini /media/fat/achievement.wav /media/fat/Scripts/.config/ra_cores/versions.json
+rm -rf /media/fat/_RA_Cores "/media/fat/_RA Cores"
+if [ -f /media/fat/MiSTer.ini ]; then
+    awk 'BEGIN{skip=0} /^\[RA_\*\]/{skip=1; next} /^\[/{skip=0} skip==0{print}' /media/fat/MiSTer.ini > /tmp/mc_mister_ini_ra && mv /tmp/mc_mister_ini_ra /media/fat/MiSTer.ini
+fi
+sync
+echo RetroAchievement Cores uninstalled.
+echo Kept /media/fat/retroachievements.cfg
+)SH";
+    showStreamingCommandWindow("UNINSTALL RA CORES", command, "RetroAchievement Cores uninstalled.", "RetroAchievement Cores uninstall failed.");
+    extraUpdateAvailable[static_cast<int>(ExtraId::RetroAchievementCores)] = false;
+    refreshCurrentExtraStatus(false);
+}
+
+static std::string raDefaultConfig() {
+    return "username=odelot\npassword=\n\nshow_challenge_show_popup=1\nshow_challenge_hide_popup=0\nshow_progress_popups=1\nshow_progress_name=1\nleaderboards-enabled=1\ndebug=0\nhardcore=0\n";
+}
+
+void App::configureRaCores() {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+
+    std::string current = remoteReadTextFile(RaConfigPath);
+    if (current.empty()) current = raDefaultConfig();
+
+    auto valueFor = [&](const std::string& key, const std::string& fallback) {
+        for (const std::string& line : splitLines(current)) {
+            if (line.rfind(key + "=", 0) == 0) return trim(line.substr(key.size() + 1));
+        }
+        return fallback;
+    };
+
+    std::vector<std::string> keys = {
+        "username", "password", "show_challenge_show_popup", "show_challenge_hide_popup",
+        "show_progress_popups", "show_progress_name", "leaderboards-enabled", "debug", "hardcore"
+    };
+    std::vector<std::string> labels = {
+        "Username", "Password", "Challenge Popup", "Missed Challenge Popup",
+        "Progress Popups", "Progress Name", "Leaderboards", "Debug", "Hardcore"
+    };
+    std::vector<std::string> values;
+    for (const std::string& key : keys) values.push_back(valueFor(key, key == "username" ? "odelot" : (key == "password" ? "" : "1")));
+    if (values[3].empty()) values[3] = "0";
+    if (values[7].empty()) values[7] = "0";
+    if (values[8].empty()) values[8] = "0";
+
+    int cursor = 0;
+    int scroll = 0;
+    std::string screenMessage;
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        u64 held = padGetButtons(&pad);
+        if ((held & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X)) == 0) break;
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.drawCard(260, 240, 760, 180, "RA CORES CONFIG");
+        ui.drawText(320, 330, "PREPARING CONFIGURATION SCREEN", UiRenderer::rgb(248, 245, 255), 2);
+        ui.endFrame();
+    }
+
+    while (appletMainLoop()) {
+        ui.beginFrame();
+        drawHeader();
+        ui.drawCard(40, 176, 1200, 424, "RETROACHIEVEMENT CORES CONFIG");
+        int visible = 6;
+        if (cursor < scroll) scroll = cursor;
+        if (cursor >= scroll + visible) scroll = cursor - visible + 1;
+        int y = 240;
+        for (int i = scroll; i < static_cast<int>(keys.size()) && i < scroll + visible; i++) {
+            std::string display = values[i].empty() ? "Not set" : values[i];
+            if (keys[i] == "password" && !values[i].empty()) display = "********";
+            if (i >= 2) display = values[i] == "1" ? "Yes" : "No";
+            ui.drawButton(76, y, 1128, 48, labels[i] + "  " + display, cursor == i, false, false);
+            y += 56;
+        }
+        ui.drawTextCentered(76, 572, 1128, std::to_string(cursor + 1) + " / " + std::to_string(keys.size()), UiRenderer::rgb(174, 154, 218), 2);
+        ui.drawMessage(screenMessage.empty() ? "A Edit/Toggle    X Save & Back    B Cancel" : screenMessage);
+        ui.drawFooter("UP/DOWN SELECT    A EDIT/TOGGLE    X SAVE    B CANCEL");
+        ui.endFrame();
+
+        padUpdate(&pad);
+        u64 buttons = padGetButtonsDown(&pad);
+        if (buttons & HidNpadButton_Up) cursor = (cursor + static_cast<int>(keys.size()) - 1) % static_cast<int>(keys.size());
+        if (buttons & HidNpadButton_Down) cursor = (cursor + 1) % static_cast<int>(keys.size());
+        if (buttons & HidNpadButton_B) {
+            lastMessage = "RA Cores config unchanged.";
+            return;
+        }
+        if (buttons & HidNpadButton_X) {
+            std::string text = current;
+            if (text.empty()) text = raDefaultConfig();
+            std::set<std::string> seen;
+            std::vector<std::string> out;
+            for (const std::string& line : splitLines(text)) {
+                if (line.find('=') == std::string::npos) { out.push_back(line); continue; }
+                std::string k = trim(line.substr(0, line.find('=')));
+                auto it = std::find(keys.begin(), keys.end(), k);
+                if (it == keys.end()) { out.push_back(line); continue; }
+                int idx = static_cast<int>(it - keys.begin());
+                out.push_back(k + "=" + values[idx]);
+                seen.insert(k);
+            }
+            for (int i = 0; i < static_cast<int>(keys.size()); i++) {
+                if (!seen.count(keys[i])) out.push_back(keys[i] + "=" + values[i]);
+            }
+            std::string finalText;
+            for (const std::string& line : out) finalText += line + "\n";
+            std::string error;
+            if (remoteWriteTextFile(RaConfigPath, finalText, error)) {
+                lastMessage = "RA Cores config saved.";
+                return;
+            }
+            screenMessage = error.empty() ? "Unable to save config." : error;
+        }
+        if (buttons & HidNpadButton_A) {
+            if (cursor < 2) {
+                editText(labels[cursor].c_str(), values[cursor], cursor == 1);
+            } else {
+                values[cursor] = values[cursor] == "1" ? "0" : "1";
+            }
+            screenMessage.clear();
+            while (appletMainLoop()) {
+                padUpdate(&pad);
+                if ((padGetButtons(&pad) & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X)) == 0) break;
+            }
+        }
+    }
+}
+
+void App::executeExtraAction(ExtraId id, int actionIndex) {
+    std::vector<std::string> actions = extraActions(id);
+    if (actionIndex < 0 || actionIndex >= static_cast<int>(actions.size())) return;
+    const std::string action = actions[actionIndex];
+
+    if (id == ExtraId::ZaparooFrontend) {
+        if (action == "INSTALL" || action == "UPDATE") installOrUpdateZaparooFrontend();
+        else if (action == "CHECK FOR UPDATES") refreshCurrentExtraStatus(true);
+        else if (action == "UNINSTALL") uninstallZaparooFrontend();
+        return;
+    }
+
+    if (action == "INSTALL") installOrUpdateRaCores(false);
+    else if (action == "UPDATE") installOrUpdateRaCores(true);
+    else if (action == "CHECK FOR UPDATES") refreshCurrentExtraStatus(true);
+    else if (action == "CONFIGURE") configureRaCores();
+    else if (action == "UNINSTALL") uninstallRaCores();
+}
+
+
 
 void App::loadSettingsTab(bool force) {
     if (!ssh.isConnected()) {
@@ -872,6 +2780,133 @@ void App::restoreSettingsDefaults() {
     loadSelectedSettingsIni();
 }
 
+
+void App::drawWallpapers() {
+    ui.drawCard(40, 176, 580, 400, "WALLPAPER STATUS");
+    ui.drawCard(660, 176, 580, 400, "WALLPAPER ACTIONS");
+
+    const std::string sourceTitle = wallpaperSourceTitle(selectedWallpaperSource);
+
+    if (gWallpaperStatusChecking && gWallpaperStatusSource == selectedWallpaperSource) {
+        if (gWallpaperPollDelay > 0) {
+            gWallpaperPollDelay--;
+        } else {
+            gWallpaperPollDelay = 30;
+            SshResult doneResult = ssh.runCommand("if [ -f " + shellQuote(gWallpaperStatusToken + ".done") + " ]; then cat " + shellQuote(gWallpaperStatusToken + ".done") + "; else echo WAIT; fi");
+            std::string state = doneResult.success ? trim(doneResult.output) : "WAIT";
+            if (state == "OK" || state == "FAIL") {
+                std::vector<int> totals;
+                std::vector<int> installedCounts;
+                std::vector<int> missingCounts;
+                std::vector<std::string> statusLines;
+
+                if (state == "OK") {
+                    cachedWallpaperStatus = {"STATUS: CHECKING...", "STEP: PARSING DATABASE"};
+                    SshResult dbResult = ssh.runCommand("cat " + shellQuote(gWallpaperStatusToken + ".b64"));
+                    std::vector<unsigned char> zipData = dbResult.success ? decodeBase64Text(dbResult.output) : std::vector<unsigned char>();
+
+                    auto checkPack = [&](const std::string& filterMode) {
+                        std::vector<WallpaperDb::Entry> entries;
+                        std::string error;
+                        if (!wallpaperEntriesFromZipBytes(selectedWallpaperSource, filterMode, zipData, entries, error)) {
+                            statusLines.push_back("STATUS: CHECK FAILED");
+                            statusLines.push_back(ellipsizeText(error, 34));
+                            totals.push_back(0);
+                            installedCounts.push_back(0);
+                            missingCounts.push_back(0);
+                            return;
+                        }
+                        int total = static_cast<int>(entries.size());
+                        int installedCount = countInstalledWallpaperEntries(entries, gWallpaperInstalledNames);
+                        totals.push_back(total);
+                        installedCounts.push_back(installedCount);
+                        missingCounts.push_back(total - installedCount);
+                    };
+
+                    if (selectedWallpaperSource == 0) {
+                        checkPack("169");
+                        if (statusLines.empty()) checkPack("43");
+                    } else {
+                        checkPack("all");
+                    }
+
+                    int allTotal = 0;
+                    int allInstalled = 0;
+                    int allMissing = 0;
+                    for (size_t i = 0; i < totals.size(); ++i) {
+                        allTotal += totals[i];
+                        allInstalled += installedCounts[i];
+                        allMissing += missingCounts[i];
+                    }
+
+                    if (statusLines.empty()) {
+                        if (allTotal <= 0) {
+                            statusLines.push_back("STATUS: CHECK FAILED");
+                            statusLines.push_back("WALLPAPERS INSTALLED: 0");
+                        } else {
+                            statusLines.push_back("STATUS: READY");
+                            statusLines.push_back("WALLPAPERS INSTALLED: " + std::to_string(allInstalled) + " / " + std::to_string(allTotal));
+                            if (allInstalled > 0 && allMissing > 0) statusLines.push_back("UPDATE AVAILABLE: YES");
+                            else if (allInstalled > 0) statusLines.push_back("UPDATE AVAILABLE: NO");
+                        }
+                    }
+                } else {
+                    statusLines.push_back("STATUS: CHECK FAILED");
+                    statusLines.push_back("Unable to download database.");
+                    totals.push_back(0);
+                    installedCounts.push_back(0);
+                    missingCounts.push_back(0);
+                }
+
+                ssh.runCommand("rm -f " + shellQuote(gWallpaperStatusToken + ".b64") + " " + shellQuote(gWallpaperStatusToken + ".done"));
+
+                statusLines.push_back("STATIC ACTIVE: " + gWallpaperStaticActive);
+                statusLines.push_back("STATIC: " + gWallpaperStaticName);
+
+                gWallpaperStatusChecking = false;
+                gWallpaperPackTotal = totals;
+                gWallpaperPackInstalled = installedCounts;
+                gWallpaperPackMissing = missingCounts;
+                gWallpaperInstalledTotal = 0;
+                gWallpaperMissingTotal = 0;
+                for (size_t i = 0; i < gWallpaperPackInstalled.size(); ++i) {
+                    gWallpaperInstalledTotal += gWallpaperPackInstalled[i];
+                    if (i < gWallpaperPackMissing.size()) gWallpaperMissingTotal += gWallpaperPackMissing[i];
+                }
+                cachedWallpaperStatus = statusLines;
+            }
+        }
+    }
+
+    ui.drawText(76, 236, "SOURCE", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 236, sourceTitle, UiRenderer::rgb(248, 245, 255), 3);
+    ui.drawText(76, 290, "SUB TAB", UiRenderer::rgb(174, 154, 218), 2);
+    ui.drawText(220, 290, std::to_string(selectedWallpaperSource + 1) + " / " + std::to_string(WallpaperSourceCount), UiRenderer::rgb(248, 245, 255), 2);
+
+    int y = 346;
+    std::vector<std::string> statusLines = cachedWallpaperStatus.empty()
+        ? std::vector<std::string>{ssh.isConnected() ? "STATUS: NOT CHECKED" : "STATUS: DISCONNECTED"}
+        : cachedWallpaperStatus;
+    for (const std::string& line : statusLines) {
+        if (y > 530) break;
+        ui.drawText(76, y, ellipsizeText(line, 42), UiRenderer::rgb(218, 208, 238), 2);
+        y += 42;
+    }
+
+    const bool actionsEnabled = ssh.isConnected();
+    std::vector<std::string> actions = wallpaperActions(selectedWallpaperSource);
+    if (!actions.empty() && selectedWallpaperAction >= static_cast<int>(actions.size())) selectedWallpaperAction = static_cast<int>(actions.size()) - 1;
+    int actionY = 232;
+    for (int i = 0; i < static_cast<int>(actions.size()); i++) {
+        if (actionY > 520) break;
+        const bool danger = actions[i].find("REMOVE") != std::string::npos;
+        ui.drawButton(696, actionY, 508, 54, actions[i], selectedWallpaperAction == i && actionsEnabled, danger, !actionsEnabled);
+        actionY += 68;
+    }
+
+    ui.drawText(696, 538, "PRESS - FOR STATIC WALLPAPER MENU", UiRenderer::rgb(174, 154, 218), 2);
+}
+
 void App::drawPassthrough() {
     ui.clear(UiRenderer::rgb(12, 10, 20));
     ui.fillRect(0, 0, UiRenderer::Width, UiRenderer::Height, UiRenderer::rgb(12, 10, 20));
@@ -891,14 +2926,18 @@ void App::drawPassthrough() {
 
 void App::handleInput(u64 buttons) {
     if (buttons & HidNpadButton_L) {
-        if (tab == Tab::Connection) tab = Tab::Settings;
+        if (tab == Tab::Connection) tab = Tab::Extras;
         else if (tab == Tab::Device) tab = Tab::Connection;
         else if (tab == Tab::Remote) tab = Tab::Device;
         else if (tab == Tab::Scripts) tab = Tab::Remote;
-        else tab = Tab::Scripts;
+        else if (tab == Tab::Settings) tab = Tab::Scripts;
+        else if (tab == Tab::Wallpapers) tab = Tab::Settings;
+        else tab = Tab::Wallpapers;
         selected = 0;
         if (tab == Tab::Scripts) refreshCurrentScriptStatus();
         if (tab == Tab::Settings) loadSettingsTab();
+        if (tab == Tab::Wallpapers) refreshWallpaperStatus();
+        if (tab == Tab::Extras) refreshCurrentExtraStatus(false);
         return;
     }
     if (buttons & HidNpadButton_R) {
@@ -906,11 +2945,15 @@ void App::handleInput(u64 buttons) {
         else if (tab == Tab::Device) tab = Tab::Remote;
         else if (tab == Tab::Remote) tab = Tab::Scripts;
         else if (tab == Tab::Scripts) tab = Tab::Settings;
+        else if (tab == Tab::Settings) tab = Tab::Wallpapers;
+        else if (tab == Tab::Wallpapers) tab = Tab::Extras;
         else tab = Tab::Connection;
         selected = 0;
         if (tab == Tab::Remote && ssh.isConnected() && remoteInstalled == "Not checked") refreshRemoteStatus();
         if (tab == Tab::Scripts) refreshCurrentScriptStatus();
         if (tab == Tab::Settings) loadSettingsTab();
+        if (tab == Tab::Wallpapers) refreshWallpaperStatus();
+        if (tab == Tab::Extras) refreshCurrentExtraStatus(false);
         return;
     }
 
@@ -918,18 +2961,88 @@ void App::handleInput(u64 buttons) {
     else if (tab == Tab::Device) handleDeviceInput(buttons);
     else if (tab == Tab::Remote) handleRemoteInput(buttons);
     else if (tab == Tab::Scripts) handleScriptsInput(buttons);
-    else handleSettingsInput(buttons);
+    else if (tab == Tab::Settings) handleSettingsInput(buttons);
+    else if (tab == Tab::Wallpapers) handleWallpapersInput(buttons);
+    else handleExtrasInput(buttons);
 }
 
 void App::handleConnectionInput(u64 buttons) {
+    if (ssh.isConnected()) {
+        connectionProfileMode = false;
+        selected = 3;
+        if (buttons & HidNpadButton_A) connectOrDisconnect();
+        return;
+    }
+
+    if (buttons & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+        connectionProfileMode = !connectionProfileMode;
+        selected = 0;
+        selectedProfile = 0;
+        profileScroll = 0;
+        lastMessage = connectionProfileMode ? "Profile mode." : "Manual connect mode.";
+        return;
+    }
+
+    if (connectionProfileMode) {
+        const int count = static_cast<int>(config.profiles.size());
+        if (count <= 0) {
+            if (buttons & HidNpadButton_B) connectionProfileMode = false;
+            return;
+        }
+
+        if (buttons & HidNpadButton_Up) selectedProfile = (selectedProfile + count - 1) % count;
+        if (buttons & HidNpadButton_Down) selectedProfile = (selectedProfile + 1) % count;
+
+        if (buttons & HidNpadButton_A) {
+            connectProfile(selectedProfile);
+            return;
+        }
+        if (buttons & HidNpadButton_X) {
+            editProfile(selectedProfile);
+            return;
+        }
+        if (buttons & HidNpadButton_Minus) {
+            deleteProfile(selectedProfile);
+            return;
+        }
+        return;
+    }
+
     if (buttons & HidNpadButton_Up) selected = (selected + 3) % 4;
     if (buttons & HidNpadButton_Down) selected = (selected + 1) % 4;
+
+    if (buttons & HidNpadButton_Plus) {
+        saveManualAsProfile();
+        return;
+    }
+    if (buttons & HidNpadButton_Minus) {
+        showMisterScanWindow();
+        return;
+    }
     if (!(buttons & HidNpadButton_A)) return;
 
     switch (selected) {
-        case 0: editText("MiSTer IP or hostname", config.host); break;
-        case 1: editText("SSH username", config.username); break;
-        case 2: editText("SSH password", config.password, true); break;
+        case 0:
+            if (ssh.isConnected()) { lastMessage = "Disconnect before editing host."; break; }
+            {
+                std::string before = config.host;
+                editText("MiSTer IP or hostname", config.host);
+                config.host = trim(config.host);
+                if (config.host != before) {
+                    clearActiveProfile();
+                    if (loadProfileForHost(config.host)) lastMessage = "Profile loaded for this IP.";
+                }
+                saveConfig();
+            }
+            break;
+        case 1:
+            if (ssh.isConnected()) { lastMessage = "Disconnect before editing username."; break; }
+            { std::string before = config.username; editText("SSH username", config.username); if (config.username != before) clearActiveProfile(); saveConfig(); }
+            break;
+        case 2:
+            if (ssh.isConnected()) { lastMessage = "Disconnect before editing password."; break; }
+            { std::string before = config.password; editText("SSH password", config.password, true); if (config.password != before) clearActiveProfile(); saveConfig(); }
+            break;
         case 3: connectOrDisconnect(); break;
     }
 }
@@ -1142,6 +3255,304 @@ void App::saveConfig() {
     else lastMessage = error;
 }
 
+bool App::hasCompleteManualConnection() const {
+    return !trim(config.host).empty() && !trim(config.username).empty() && !trim(config.password).empty();
+}
+
+int App::profileIndexForHost(const std::string& host) const {
+    const std::string wanted = toLower(trim(host));
+    if (wanted.empty()) return -1;
+    for (int i = 0; i < static_cast<int>(config.profiles.size()); ++i) {
+        if (toLower(trim(config.profiles[i].host)) == wanted) return i;
+    }
+    return -1;
+}
+
+bool App::loadProfileForHost(const std::string& host) {
+    int index = profileIndexForHost(host);
+    if (index < 0) return false;
+    const ConnectionProfile& profile = config.profiles[index];
+    config.name = profile.name;
+    activeProfileName = profile.name;
+    config.host = profile.host;
+    config.username = profile.username.empty() ? "root" : profile.username;
+    config.password = profile.password.empty() ? "1" : profile.password;
+    selectedProfile = index;
+    return true;
+}
+
+void App::clearActiveProfile() {
+    activeProfileName.clear();
+    config.name.clear();
+}
+
+void App::saveManualAsProfile() {
+    if (!hasCompleteManualConnection()) {
+        lastMessage = "Enter host, username and password first.";
+        return;
+    }
+
+    std::string profileName = activeProfileName.empty() ? "MiSTer" : activeProfileName;
+    editText("Profile name", profileName);
+    profileName = trim(profileName);
+    if (profileName.empty()) {
+        lastMessage = "Profile name is required.";
+        return;
+    }
+
+    ConnectionProfile profile;
+    profile.name = profileName;
+    profile.host = trim(config.host);
+    profile.username = trim(config.username).empty() ? "root" : trim(config.username);
+    profile.password = trim(config.password).empty() ? "1" : trim(config.password);
+    config.name = profile.name;
+    activeProfileName = profile.name;
+    config.profiles.push_back(profile);
+    saveConfig();
+    selectedProfile = static_cast<int>(config.profiles.size()) - 1;
+    lastMessage = "Profile saved.";
+}
+
+void App::connectProfile(int index) {
+    if (index < 0 || index >= static_cast<int>(config.profiles.size())) return;
+    const ConnectionProfile& profile = config.profiles[index];
+    config.name = profile.name;
+    activeProfileName = profile.name;
+    config.host = profile.host;
+    config.username = profile.username.empty() ? "root" : profile.username;
+    config.password = profile.password.empty() ? "1" : profile.password;
+    saveConfig();
+    connectOrDisconnect();
+}
+
+void App::editProfile(int index) {
+    if (index < 0 || index >= static_cast<int>(config.profiles.size())) return;
+    ConnectionProfile profile = config.profiles[index];
+    const std::string originalName = profile.name;
+    const std::string originalHost = profile.host;
+    int cursor = 0;
+    std::string screenMessage = "A Edit    X Save & Back    B Cancel";
+
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    while (appletMainLoop()) {
+        ui.beginFrame();
+        drawHeader();
+        ui.drawCard(220, 126, 840, 474, "EDIT PROFILE");
+
+        std::vector<std::string> labels = {"Name", "Host", "Username", "Password"};
+        std::vector<std::string> values = {
+            profile.name.empty() ? "Not set" : profile.name,
+            profile.host.empty() ? "Not set" : profile.host,
+            profile.username.empty() ? "root" : profile.username,
+            profile.password.empty() ? "Not set" : "********"
+        };
+
+        for (int i = 0; i < 4; ++i) {
+            ui.drawButton(260, 196 + i * 64, 760, 54, labels[i] + "  " + values[i], cursor == i, false, false);
+        }
+
+        ui.drawMessage(screenMessage);
+        ui.drawFooter("UP/DOWN SELECT    A EDIT    X SAVE    B CANCEL");
+        ui.endFrame();
+
+        padUpdate(&pad);
+        const u64 buttons = padGetButtonsDown(&pad);
+        if (buttons & HidNpadButton_Up) cursor = (cursor + 3) % 4;
+        if (buttons & HidNpadButton_Down) cursor = (cursor + 1) % 4;
+        if (buttons & HidNpadButton_B) {
+            lastMessage = "Profile edit cancelled.";
+            return;
+        }
+        if (buttons & HidNpadButton_A) {
+            if (cursor == 0) editText("Profile name", profile.name);
+            else if (cursor == 1) editText("MiSTer IP or hostname", profile.host);
+            else if (cursor == 2) editText("SSH username", profile.username);
+            else if (cursor == 3) editText("SSH password", profile.password, true);
+            screenMessage = "A Edit    X Save & Back    B Cancel";
+            while (appletMainLoop()) {
+                padUpdate(&pad);
+                if ((padGetButtons(&pad) & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Up | HidNpadButton_Down)) == 0) break;
+            }
+        }
+        if (buttons & HidNpadButton_X) {
+            profile.name = trim(profile.name);
+            profile.host = trim(profile.host);
+            profile.username = trim(profile.username);
+            profile.password = trim(profile.password);
+            if (profile.name.empty()) { screenMessage = "Profile name is required."; continue; }
+            if (profile.host.empty()) { screenMessage = "Host is required."; continue; }
+            if (profile.username.empty()) profile.username = "root";
+            if (profile.password.empty()) profile.password = "1";
+
+            const bool editedActiveProfile = !activeProfileName.empty() && activeProfileName == originalName;
+            const bool manualWasPointingAtProfile = toLower(trim(config.host)) == toLower(trim(originalHost));
+            config.profiles[index] = profile;
+            if (editedActiveProfile || manualWasPointingAtProfile) {
+                config.name = profile.name;
+                activeProfileName = profile.name;
+                config.host = profile.host;
+                config.username = profile.username;
+                config.password = profile.password;
+            }
+            saveConfig();
+            lastMessage = "Profile updated.";
+            return;
+        }
+    }
+}
+
+void App::deleteProfile(int index) {
+    if (index < 0 || index >= static_cast<int>(config.profiles.size())) return;
+    std::string name = config.profiles[index].name;
+    std::string body = "DELETE PROFILE " + name + "?";
+    if (!confirm("DELETE PROFILE", body.c_str())) return;
+
+    config.profiles.erase(config.profiles.begin() + index);
+    if (activeProfileName == name) {
+        activeProfileName.clear();
+        config.name.clear();
+    }
+    if (selectedProfile >= static_cast<int>(config.profiles.size())) selectedProfile = static_cast<int>(config.profiles.size()) - 1;
+    if (selectedProfile < 0) selectedProfile = 0;
+    profileScroll = 0;
+    saveConfig();
+    lastMessage = "Profile deleted.";
+}
+
+void App::connectScannedHost(const std::string& host, bool saveAsProfile) {
+    if (host.empty()) return;
+
+    int existingProfile = profileIndexForHost(host);
+    if (existingProfile >= 0) {
+        loadProfileForHost(host);
+        saveConfig();
+        lastMessage = "Profile loaded for this IP.";
+        connectOrDisconnect();
+        return;
+    }
+
+    config.host = host;
+    clearActiveProfile();
+    if (trim(config.username).empty()) config.username = "root";
+    if (trim(config.password).empty()) config.password = "1";
+
+    if (saveAsProfile) {
+        std::string profileName = "MiSTer " + host;
+        editText("Profile name", profileName);
+        profileName = trim(profileName);
+        if (profileName.empty()) {
+            lastMessage = "Profile name is required.";
+            return;
+        }
+        ConnectionProfile profile;
+        profile.name = profileName;
+        profile.host = config.host;
+        profile.username = config.username;
+        profile.password = config.password;
+        config.name = profile.name;
+        activeProfileName = profile.name;
+        config.profiles.push_back(profile);
+        selectedProfile = static_cast<int>(config.profiles.size()) - 1;
+    }
+
+    saveConfig();
+    connectOrDisconnect();
+}
+
+void App::showMisterScanWindow() {
+    std::string subnet = subnetBaseFromIp(config.host);
+    if (subnet.empty()) subnet = currentSubnetBase();
+    if (subnet.empty()) subnet = "192.168.1.";
+
+    std::vector<std::string> foundHosts;
+    std::string message = "Scanning " + subnet + "1-254 for MiSTer...";
+
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    auto drawScan = [&](const std::string& line, int progress, bool completed, int selectedHost) {
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.fillRect(0, 0, UiRenderer::Width, UiRenderer::Height, UiRenderer::rgb(12, 10, 20));
+        ui.drawCard(220, 105, 840, 500, "SCAN FOR MISTER");
+        ui.drawText(260, 170, line, UiRenderer::rgb(248, 245, 255), 2);
+        if (!completed) {
+            ui.drawText(260, 220, "PROGRESS  " + std::to_string(progress) + " / 254", UiRenderer::rgb(174, 154, 218), 2);
+            ui.drawFooter("SCANNING...    B CANCEL");
+        } else {
+            if (foundHosts.empty()) {
+                ui.drawText(260, 250, "NO MISTER DEVICES FOUND", UiRenderer::rgb(248, 245, 255), 3);
+                ui.drawText(260, 310, "CHECK THAT YOUR SWITCH AND MISTER ARE ON THE SAME NETWORK", UiRenderer::rgb(218, 208, 238), 2);
+            } else {
+                ui.drawText(260, 220, "FOUND MISTER DEVICES", UiRenderer::rgb(174, 154, 218), 2);
+                const int visibleRows = 5;
+                int scroll = selectedHost - visibleRows + 1;
+                if (scroll < 0) scroll = 0;
+                for (int row = 0; row < visibleRows; ++row) {
+                    int index = scroll + row;
+                    if (index >= static_cast<int>(foundHosts.size())) break;
+                    ui.drawButton(260, 260 + row * 62, 760, 54, foundHosts[index], selectedHost == index);
+                }
+            }
+            ui.drawFooter("UP/DOWN SELECT    A CONNECT    X SAVE & CONNECT    B BACK");
+        }
+        ui.endFrame();
+    };
+
+    bool cancelled = false;
+    for (int i = 1; i <= 254; ++i) {
+        padUpdate(&pad);
+        if (padGetButtonsDown(&pad) & HidNpadButton_B) {
+            cancelled = true;
+            break;
+        }
+
+        const std::string host = subnet + std::to_string(i);
+        if (i == 1 || i % 8 == 0) drawScan(message, i, false, 0);
+        if (tcpPortOpen(host, 22, 18)) {
+            drawScan("Checking " + host + " for MiSTer identity...", i, false, 0);
+            if (hostLooksLikeMister(host, config)) foundHosts.push_back(host);
+        }
+    }
+
+    if (cancelled) {
+        lastMessage = "Scan cancelled.";
+        return;
+    }
+
+    int scanSelected = 0;
+    bool inputReleased = false;
+    while (appletMainLoop()) {
+        drawScan(foundHosts.empty() ? "Scan complete." : "Scan complete. Select a MiSTer.", 254, true, scanSelected);
+        padUpdate(&pad);
+        const u64 held = padGetButtons(&pad);
+        const u64 buttons = padGetButtonsDown(&pad);
+        if (!inputReleased) {
+            const u64 block = HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Up | HidNpadButton_Down;
+            if ((held & block) == 0) inputReleased = true;
+            continue;
+        }
+        if (buttons & HidNpadButton_B) {
+            lastMessage = "Scan closed.";
+            return;
+        }
+        if (!foundHosts.empty()) {
+            if (buttons & HidNpadButton_Up) scanSelected = (scanSelected + static_cast<int>(foundHosts.size()) - 1) % static_cast<int>(foundHosts.size());
+            if (buttons & HidNpadButton_Down) scanSelected = (scanSelected + 1) % static_cast<int>(foundHosts.size());
+            if (buttons & HidNpadButton_A) {
+                connectScannedHost(foundHosts[scanSelected], false);
+                return;
+            }
+            if (buttons & HidNpadButton_X) {
+                connectScannedHost(foundHosts[scanSelected], true);
+                return;
+            }
+        }
+    }
+}
+
 void App::connectOrDisconnect() {
     if (ssh.isConnected()) {
         if (passthroughActive) stopPassthrough();
@@ -1256,14 +3667,155 @@ void App::reboot() {
     }
     if (!confirm("CONFIRM REBOOT", "ARE YOU SURE YOU WANT TO REBOOT THE MISTER?")) return;
 
-    SshResult result = ssh.runCommand("nohup /sbin/reboot >/dev/null 2>&1 &");
+    SshResult result = ssh.runCommand("sync; nohup /sbin/reboot >/dev/null 2>&1 &");
+    if (result.success) {
+        waitForReconnectAfterReboot("REBOOT MISTER", "Reboot command sent. Waiting for MiSTer...");
+        return;
+    }
+
+    lastMessage = result.error.empty() ? "Reboot command may have failed." : result.error;
+}
+
+bool App::sendSoftRebootCommand() {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return false;
+    }
+
+    // Match the desktop app behavior: its Extras soft reboot path calls
+    // return_to_menu_remote(), which sends a MiSTer menu reload command through
+    // /dev/MiSTer_cmd instead of using /sbin/reboot or echo reboot.
+    SshResult result = ssh.runCommand(std::string("sync; ") + MisterMenuReloadCommand);
+    lastMessage = result.success ? "Soft reboot command sent." : "Soft reboot command may have failed.";
+    return result.success;
+}
+
+void App::waitForReconnectAfterReboot(const std::string& title, const std::string& firstLine) {
+    if (passthroughActive) passthroughActive = false;
+    remote.disconnect();
     ssh.disconnect();
-    status = "Disconnected";
+
+    status = "Rebooting...";
     sdStorage = "Rebooting...";
     usbStorage = "Rebooting...";
     smbStatus = "Rebooting...";
     nowPlaying.clear();
-    lastMessage = result.success ? "Reboot command sent." : "Reboot command may have failed.";
+
+    auto drawReconnectWindow = [&](const std::string& line, int attempt, bool canCancel) {
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.fillRect(0, 0, UiRenderer::Width, 92, UiRenderer::rgb(20, 16, 34));
+        ui.fillRect(0, 90, UiRenderer::Width, 4, UiRenderer::rgb(143, 84, 255));
+        ui.drawText(42, 30, title, UiRenderer::rgb(248, 245, 255), 3);
+        ui.drawCard(240, 180, 800, 320, "RECONNECTING");
+        ui.drawText(300, 270, line, UiRenderer::rgb(248, 245, 255), 2);
+        if (attempt > 0) {
+            ui.drawText(300, 326, "Attempt: " + std::to_string(attempt), UiRenderer::rgb(174, 154, 218), 2);
+        }
+        ui.drawText(300, 382, "MiSTer Companion NX will reconnect automatically.", UiRenderer::rgb(218, 208, 238), 2);
+        ui.drawFooter(canCancel ? "B STOP WAITING" : "PLEASE WAIT");
+        ui.endFrame();
+    };
+
+    drawReconnectWindow(firstLine, 0, false);
+    svcSleepThread(700000000LL);
+
+    PadState pad;
+    padInitializeDefault(&pad);
+    bool inputReleased = false;
+
+    auto checkCancel = [&]() -> bool {
+        padUpdate(&pad);
+        const u64 held = padGetButtons(&pad);
+        const u64 down = padGetButtonsDown(&pad);
+        if (!inputReleased) {
+            if ((held & HidNpadButton_B) == 0) inputReleased = true;
+            return false;
+        }
+        return (down & HidNpadButton_B) != 0;
+    };
+
+    auto cancelReconnect = [&]() {
+        status = "Disconnected";
+        sdStorage = "Not refreshed";
+        usbStorage = "Not refreshed";
+        smbStatus = "Not refreshed";
+        lastMessage = "Reconnect cancelled.";
+    };
+
+    bool rebootStarted = false;
+    for (int tick = 0; tick < 90 && appletMainLoop(); tick++) {
+        drawReconnectWindow("Waiting for MiSTer to start rebooting...", 0, true);
+        if (checkCancel()) {
+            cancelReconnect();
+            return;
+        }
+
+        std::string probeMessage;
+        if (!ssh.connect(config, probeMessage)) {
+            rebootStarted = true;
+            break;
+        }
+        ssh.disconnect();
+        svcSleepThread(100000000LL);
+    }
+
+    if (!rebootStarted) {
+        for (int tick = 0; tick < 20 && appletMainLoop(); tick++) {
+            drawReconnectWindow("Reboot is taking longer to start. Waiting...", 0, true);
+            if (checkCancel()) {
+                cancelReconnect();
+                return;
+            }
+            svcSleepThread(100000000LL);
+        }
+    }
+
+    for (int attempt = 1; attempt <= 45 && appletMainLoop(); attempt++) {
+        drawReconnectWindow("Waiting for MiSTer to come back online...", attempt, true);
+
+        bool cancelled = false;
+        for (int tick = 0; tick < 20 && appletMainLoop(); tick++) {
+            if (checkCancel()) {
+                cancelled = true;
+                break;
+            }
+            svcSleepThread(100000000LL);
+        }
+
+        if (cancelled) {
+            cancelReconnect();
+            return;
+        }
+
+        status = "Reconnecting...";
+        drawReconnectWindow("Trying to reconnect over SSH...", attempt, true);
+
+        std::string message;
+        if (ssh.connect(config, message)) {
+            status = "Connected";
+            lastMessage = "MiSTer reboot complete. Reconnected.";
+            refreshDevice();
+            if (tab == Tab::Extras) refreshCurrentExtraStatus(false);
+            return;
+        }
+        ssh.disconnect();
+    }
+
+    status = "Disconnected";
+    sdStorage = "Not refreshed";
+    usbStorage = "Not refreshed";
+    smbStatus = "Not refreshed";
+    lastMessage = "MiSTer did not reconnect automatically.";
+}
+
+void App::softRebootAndReconnect(const std::string& title) {
+    if (!ssh.isConnected()) {
+        lastMessage = "No active MiSTer connection.";
+        return;
+    }
+    sendSoftRebootCommand();
+    waitForReconnectAfterReboot(title, "Soft reboot command sent. Waiting for MiSTer...");
 }
 
 void App::refreshRemoteStatus() {
@@ -1578,7 +4130,7 @@ void App::showOutputWindow(const std::string& title, const std::string& output) 
     }
 }
 
-void App::showStreamingCommandWindow(const std::string& title, const std::string& command, const std::string& successMessage, const std::string& failureMessage) {
+bool App::showStreamingCommandWindow(const std::string& title, const std::string& command, const std::string& successMessage, const std::string& failureMessage, bool* rebootDetected) {
     std::vector<std::string> lines;
     lines.push_back("Starting...");
     int scroll = 0;
@@ -1586,6 +4138,7 @@ void App::showStreamingCommandWindow(const std::string& title, const std::string
     bool success = false;
     std::string finalError;
     std::string completionTitle = "RUNNING";
+    bool detectedReboot = false;
 
     auto appendText = [&](const std::string& text) {
         std::stringstream stream(text);
@@ -1632,6 +4185,7 @@ void App::showStreamingCommandWindow(const std::string& title, const std::string
 
     SshResult result = ssh.runCommandStreaming(command + " 2>&1", [&](const std::string& chunk) {
         appendText(chunk);
+        if (textMentionsReboot(chunk)) detectedReboot = true;
 
         PadState pad;
         padInitializeDefault(&pad);
@@ -1642,6 +4196,9 @@ void App::showStreamingCommandWindow(const std::string& title, const std::string
 
         drawStreamingWindow();
     });
+
+    if (textMentionsReboot(result.output) || textMentionsReboot(result.error)) detectedReboot = true;
+    if (rebootDetected) *rebootDetected = detectedReboot;
 
     success = result.success;
     completionTitle = success ? "FINISHED" : "FAILED";
@@ -1667,6 +4224,7 @@ void App::showStreamingCommandWindow(const std::string& title, const std::string
     }
 
     lastMessage = success ? successMessage : failureMessage;
+    return success;
 }
 
 void App::runScriptCommand(const std::string& title, const std::string& command, bool confirmFirst) {
@@ -1911,6 +4469,17 @@ void App::configureUpdateAll() {
     bool shouldSave = false;
     PadState pad;
     padInitializeDefault(&pad);
+
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        u64 held = padGetButtons(&pad);
+        if ((held & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X)) == 0) break;
+        ui.beginFrame();
+        ui.clear(UiRenderer::rgb(12, 10, 20));
+        ui.drawCard(260, 240, 760, 180, "UPDATE ALL CONFIG");
+        ui.drawText(320, 330, "PREPARING CONFIGURATION SCREEN", UiRenderer::rgb(248, 245, 255), 2);
+        ui.endFrame();
+    }
 
     auto toggleEnabledByLabel = [&](const std::string& label) -> bool {
         for (const ConfigToggle& toggle : toggles) {
@@ -2881,8 +5450,19 @@ void App::executeScriptAction(ScriptId id, int actionIndex) {
                 refreshCurrentScriptStatus();
             } else if (action == "RUN") {
                 if (!confirm("RUN UPDATE ALL", "ARE YOU SURE?")) return;
-                showStreamingCommandWindow("UPDATE ALL", "/media/fat/Scripts/update_all.sh", "Update All complete.", "Update All failed.");
-                refreshCurrentScriptStatus();
+                bool rebootDetected = false;
+                const bool updateAllSuccess = showStreamingCommandWindow("UPDATE ALL", "/media/fat/Scripts/update_all.sh", "Update All complete.", "Update All failed.", &rebootDetected);
+
+                bool connectionLostAfterRun = false;
+                if (rebootDetected || !updateAllSuccess) {
+                    SshResult probe = ssh.runCommand("printf MC_ALIVE");
+                    connectionLostAfterRun = !probe.success || trim(probe.output) != "MC_ALIVE";
+                }
+
+                if (rebootDetected || connectionLostAfterRun) {
+                    waitForReconnectAfterReboot("UPDATE ALL", "Reboot detected. Waiting for MiSTer...");
+                }
+                if (ssh.isConnected()) refreshCurrentScriptStatus();
             } else if (action == "UNINSTALL") {
                 scriptUninstall("UPDATE ALL", "rm -f /media/fat/Scripts/update_all.sh");
                 refreshCurrentScriptStatus();
@@ -2897,7 +5477,7 @@ void App::executeScriptAction(ScriptId id, int actionIndex) {
                     "echo Finding latest Zaparoo release...; "
                     "JSON=/tmp/mc_zap/release.json; "
                     "wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O \"$JSON\" https://api.github.com/repos/ZaparooProject/zaparoo-core/releases/latest || exit 1; "
-                    "URL=$(sed -n 's/.*\\\"browser_download_url\\\": *\\\"\\([^\\\"]*mister_arm[^\\\"]*\\.zip\\)\\\".*/\\1/p' \"$JSON\" | head -1); "
+                    "URL=$(sed -n 's/.*\\\"browser_download_url\\\": *\\\"\\([^\\\"]*mister_arm[^\\\"]*\\.zip\\)\\\".*/\1/p' \"$JSON\" | head -1); "
                     "if [ -z \"$URL\" ]; then echo Unable to find MiSTer Zaparoo release.; exit 1; fi; "
                     "echo Downloading Zaparoo package...; "
                     "wget --no-check-certificate -O /tmp/mc_zap/zaparoo.zip \"$URL\" || exit 1; "

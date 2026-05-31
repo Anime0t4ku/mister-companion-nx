@@ -201,6 +201,38 @@ void UiRenderer::drawStatusPill(int x, int y, const std::string& label, bool act
     drawTextCentered(x, y + 9, w, label, rgb(248, 245, 255), 2);
 }
 
+
+void UiRenderer::drawImageRgba(int x, int y, int w, int h, const unsigned char* rgba, int imageW, int imageH) {
+    if (!pixels || !rgba || w <= 0 || h <= 0 || imageW <= 0 || imageH <= 0) return;
+
+    const float srcAspect = static_cast<float>(imageW) / static_cast<float>(imageH);
+    const float dstAspect = static_cast<float>(w) / static_cast<float>(h);
+
+    int drawW = w;
+    int drawH = h;
+    if (srcAspect > dstAspect) {
+        drawH = std::max(1, static_cast<int>(w / srcAspect));
+    } else {
+        drawW = std::max(1, static_cast<int>(h * srcAspect));
+    }
+
+    const int drawX = x + (w - drawW) / 2;
+    const int drawY = y + (h - drawH) / 2;
+
+    for (int yy = 0; yy < drawH; yy++) {
+        const int sy = std::min(imageH - 1, yy * imageH / drawH);
+        const int dy = drawY + yy;
+        if (dy < 0 || dy >= Height) continue;
+        for (int xx = 0; xx < drawW; xx++) {
+            const int sx = std::min(imageW - 1, xx * imageW / drawW);
+            const int dx = drawX + xx;
+            if (dx < 0 || dx >= Width) continue;
+            const unsigned char* px = rgba + ((sy * imageW + sx) * 4);
+            pixels[dy * pitch + dx] = RGBA8(px[0], px[1], px[2], px[3]);
+        }
+    }
+}
+
 void UiRenderer::drawFooter(const std::string& text) {
     fillRect(0, Height - 54, Width, 54, rgb(20, 17, 31));
     drawRect(0, Height - 54, Width, 2, rgb(74, 58, 112), 2);

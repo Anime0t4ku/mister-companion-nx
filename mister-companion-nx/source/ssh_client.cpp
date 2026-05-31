@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <libssh2.h>
+#include <libssh2_sftp.h>
 
 static std::string lastSocketError() {
     return std::string(strerror(errno));
@@ -112,6 +113,64 @@ bool SshClient::connect(const AppConfig& config, std::string& message) {
     }
 
     message = test.output.empty() ? "Connected successfully." : test.output;
+    return true;
+}
+
+
+bool SshClient::readRemoteFile(const std::string& path, std::vector<unsigned char>& data, std::string& error, size_t maxBytes) {
+    data.clear();
+    error.clear();
+
+    if (!isConnected()) {
+        error = "No active SSH connection.";
+        return false;
+    }
+
+    LIBSSH2_SESSION* sshSession = static_cast<LIBSSH2_SESSION*>(session);
+    LIBSSH2_SFTP* sftp = libssh2_sftp_init(sshSession);
+    if (!sftp) {
+        error = "Unable to start SFTP session.";
+        return false;
+    }
+
+    LIBSSH2_SFTP_HANDLE* handle = libssh2_sftp_open(sftp, path.c_str(), LIBSSH2_FXF_READ, 0);
+    if (!handle) {
+        error = "Unable to open remote file.";
+        libssh2_sftp_shutdown(sftp);
+        return false;
+    }
+
+    char buffer[8192];
+    for (;;) {
+        ssize_t bytes = libssh2_sftp_read(handle, buffer, sizeof(buffer));
+        if (bytes > 0) {
+            if (data.size() + static_cast<size_t>(bytes) > maxBytes) {
+                error = "Preview image is too large.";
+                libssh2_sftp_close(handle);
+                libssh2_sftp_shutdown(sftp);
+                data.clear();
+                return false;
+            }
+            data.insert(data.end(), buffer, buffer + bytes);
+            continue;
+        }
+        if (bytes == 0) break;
+        if (bytes == LIBSSH2_ERROR_EAGAIN) continue;
+        error = "Unable to read remote file.";
+        libssh2_sftp_close(handle);
+        libssh2_sftp_shutdown(sftp);
+        data.clear();
+        return false;
+    }
+
+    libssh2_sftp_close(handle);
+    libssh2_sftp_shutdown(sftp);
+
+    if (data.empty()) {
+        error = "Remote file is empty.";
+        return false;
+    }
+
     return true;
 }
 

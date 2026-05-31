@@ -22,6 +22,8 @@ private:
         Remote,
         Scripts,
         Settings,
+        Wallpapers,
+        Extras,
     };
 
     enum class ScriptId {
@@ -38,12 +40,21 @@ private:
         RaViewer,
     };
 
+    enum class ExtraId {
+        ZaparooFrontend,
+        RetroAchievementCores,
+    };
+
     AppConfig config;
     SshClient ssh;
     RemoteClient remote;
     UiRenderer ui;
     Tab tab = Tab::Connection;
     int selected = 0;
+    bool connectionProfileMode = false;
+    std::string activeProfileName;
+    int selectedProfile = 0;
+    int profileScroll = 0;
     std::string status = "Disconnected";
     std::string lastMessage;
     std::string sdStorage = "Not refreshed";
@@ -56,6 +67,20 @@ private:
     bool passthroughActive = false;
     int selectedScript = 0;
     std::vector<std::vector<std::string>> cachedScriptStatus;
+    int selectedWallpaperSource = 0;
+    int selectedWallpaperAction = 0;
+    std::vector<std::string> cachedWallpaperStatus;
+    std::vector<int> wallpaperPackTotal;
+    std::vector<int> wallpaperPackInstalled;
+    std::vector<int> wallpaperPackMissing;
+    int wallpaperInstalledTotal = 0;
+    int wallpaperMissingTotal = 0;
+    int selectedExtra = 0;
+    std::vector<std::vector<std::string>> cachedExtraStatus;
+    bool extraUpdateAvailable[2] = {false, false};
+    std::string extraLatestVersion[2];
+    bool extraUpdateCheckPending = false;
+    int extraUpdateCheckIndex = -1;
     std::vector<std::string> settingsIniFiles;
     std::vector<std::string> settingsFonts;
     std::string selectedSettingsIni = "MiSTer.ini";
@@ -73,6 +98,8 @@ private:
     void drawRemote();
     void drawScripts();
     void drawSettings();
+    void drawWallpapers();
+    void drawExtras();
     void drawPassthrough();
 
     void handleInput(u64 buttons);
@@ -81,6 +108,8 @@ private:
     void handleRemoteInput(u64 buttons);
     void handleScriptsInput(u64 buttons);
     void handleSettingsInput(u64 buttons);
+    void handleWallpapersInput(u64 buttons);
+    void handleExtrasInput(u64 buttons);
     void handlePassthroughInput(u64 down, u64 up, u64 held);
 
     void editText(const char* title, std::string& value, bool password = false);
@@ -88,6 +117,16 @@ private:
 
     void saveConfig();
     void connectOrDisconnect();
+    bool hasCompleteManualConnection() const;
+    void saveManualAsProfile();
+    void connectProfile(int index);
+    int profileIndexForHost(const std::string& host) const;
+    bool loadProfileForHost(const std::string& host);
+    void clearActiveProfile();
+    void editProfile(int index);
+    void deleteProfile(int index);
+    void showMisterScanWindow();
+    void connectScannedHost(const std::string& host, bool saveAsProfile);
 
     void refreshDevice();
     void refreshStorage();
@@ -96,6 +135,9 @@ private:
 
     void toggleSmb();
     void reboot();
+    bool sendSoftRebootCommand();
+    void waitForReconnectAfterReboot(const std::string& title, const std::string& firstLine);
+    void softRebootAndReconnect(const std::string& title);
     void returnToMenu();
 
     void refreshRemoteStatus();
@@ -122,10 +164,30 @@ private:
     void scriptUninstall(const std::string& title, const std::string& command);
     void runScriptCommand(const std::string& title, const std::string& command, bool confirmFirst = false);
     void showOutputWindow(const std::string& title, const std::string& output);
-    void showStreamingCommandWindow(const std::string& title, const std::string& command, const std::string& successMessage, const std::string& failureMessage);
+    bool showStreamingCommandWindow(const std::string& title, const std::string& command, const std::string& successMessage, const std::string& failureMessage, bool* rebootDetected = nullptr);
     bool askField(const char* title, std::string& value, bool password = false);
     bool askYesNo(const char* title, const char* body, bool defaultYes = false);
     void ensureScriptsDirs();
+
+    std::string wallpaperSourceTitle(int index) const;
+    std::vector<std::string> wallpaperActions(int index) const;
+    void refreshWallpaperStatus();
+    void executeWallpaperAction(int actionIndex);
+    void installWallpaperPack(const std::string& title, const std::string& dbUrl, const std::string& rawBase, const std::string& filterMode);
+    void removeWallpaperPack(const std::string& title, const std::string& dbUrl, const std::string& rawBase, const std::string& filterMode);
+    void showStaticWallpaperMenu();
+
+    std::string extraTitle(ExtraId id) const;
+    std::vector<std::string> extraActions(ExtraId id) const;
+    std::vector<std::string> extraStatus(ExtraId id);
+    void refreshCurrentExtraStatus(bool checkLatest = false);
+    void performPendingExtraUpdateCheck();
+    void executeExtraAction(ExtraId id, int actionIndex);
+    void installOrUpdateZaparooFrontend();
+    void uninstallZaparooFrontend();
+    void installOrUpdateRaCores(bool updateOnly = false);
+    void uninstallRaCores();
+    void configureRaCores();
 
     void loadSettingsTab(bool force = false);
     bool ensureRemoteMisterIni();
