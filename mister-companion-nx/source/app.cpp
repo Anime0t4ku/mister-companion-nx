@@ -73,7 +73,7 @@ static const char* PcnRawBase = "https://raw.githubusercontent.com/Anime0t4ku/Mi
 static const char* PcnPremiumRawBase = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/main/";
 static const char* Ot4kuRawBase = "https://raw.githubusercontent.com/Anime0t4ku/MiSTerWallpapers/main/";
 
-static constexpr int ExtraCount = 2;
+static constexpr int ExtraCount = 3;
 static const char* RaConfigPath = "/media/fat/retroachievements.cfg";
 
 
@@ -2073,6 +2073,7 @@ std::string App::extraTitle(ExtraId id) const {
     switch (id) {
         case ExtraId::ZaparooFrontend: return "ZAPAROO FRONTEND";
         case ExtraId::RetroAchievementCores: return "RETROACHIEVEMENT CORES";
+        case ExtraId::Mms2GbCore: return "MMS2 GB CORE";
     }
     return "EXTRA";
 }
@@ -2109,6 +2110,7 @@ static std::string raSourcesHeredoc();
 std::vector<std::string> App::extraStatus(ExtraId id) {
     if (!ssh.isConnected()) {
         if (id == ExtraId::ZaparooFrontend) return {"INSTALLED: NO", "VERSION: UNKNOWN"};
+        if (id == ExtraId::Mms2GbCore) return {"INSTALLED: NO", "VERSION: UNKNOWN"};
         return {"INSTALLED: NO"};
     }
 
@@ -2118,6 +2120,16 @@ std::vector<std::string> App::extraStatus(ExtraId id) {
             "if [ -f /media/fat/zaparoo/MiSTer_Zaparoo ] && [ -f /media/fat/zaparoo/frontend ] && [ -f /media/fat/zaparoo/menu_zaparoo.rbf ] && grep -q 'main=zaparoo/MiSTer_Zaparoo' /media/fat/MiSTer.ini 2>/dev/null; then INSTALLED=YES; fi; "
             "VERSION=$(cat /media/fat/Scripts/.config/zaparoo_frontend/version.txt 2>/dev/null); "
             "[ -z \"$VERSION\" ] && VERSION=$(cat /media/fat/Scripts/.config/zaparoo_launcher/version.txt 2>/dev/null); "
+            "[ -z \"$VERSION\" ] && VERSION=UNKNOWN; "
+            "echo INSTALLED: $INSTALLED; echo VERSION: $VERSION";
+        return splitLines(runCommandMessage(command));
+    }
+
+    if (id == ExtraId::Mms2GbCore) {
+        const std::string command =
+            "INSTALLED=NO; "
+            "VERSION=$(ls /media/fat/MMS2/Gameboy_*.rbf 2>/dev/null | sed -n 's/.*Gameboy_\\([0-9][0-9]*\\)\\.rbf/\\1/p' | sort | tail -1); "
+            "if [ -n \"$VERSION\" ] && [ -f '/media/fat/Load GB-GBC Cartridge.mgl' ] && [ -f /media/fat/config/MMS2_GB_Cart.CFG ]; then INSTALLED=YES; fi; "
             "[ -z \"$VERSION\" ] && VERSION=UNKNOWN; "
             "echo INSTALLED: $INSTALLED; echo VERSION: $VERSION";
         return splitLines(runCommandMessage(command));
@@ -2200,6 +2212,27 @@ echo "MC_ZAP_LATEST:$latest"
         std::vector<std::string> checkLines = splitLines(runCommandMessage(checkCommand));
         std::string installed = normalizeExtraVersion(statusValue(checkLines, "MC_ZAP_INSTALLED"));
         std::string latest = normalizeExtraVersion(statusValue(checkLines, "MC_ZAP_LATEST"));
+
+        if (latest.empty()) {
+            checkFailed = true;
+        } else if (!installed.empty() && installed != latest) {
+            updateCount = 1;
+        }
+    } else if (id == ExtraId::Mms2GbCore) {
+        const std::string checkCommand = R"SH(
+TMP=/tmp/mc_mms2_gb_check_$$
+rm -rf "$TMP"
+mkdir -p "$TMP"
+wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$TMP/contents.json" "https://api.github.com/repos/Heber-co-uk/Gameboy_MiSTer_Cart/contents/releases?ref=master" >/dev/null 2>&1
+latest=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"Gameboy_\([0-9][0-9]*\)\.rbf".*/\1/p' "$TMP/contents.json" | sort | tail -1)
+installed=$(ls /media/fat/MMS2/Gameboy_*.rbf 2>/dev/null | sed -n 's/.*Gameboy_\([0-9][0-9]*\)\.rbf/\1/p' | sort | tail -1)
+echo "MC_MMS2_INSTALLED:$installed"
+echo "MC_MMS2_LATEST:$latest"
+rm -rf "$TMP"
+)SH";
+        std::vector<std::string> checkLines = splitLines(runCommandMessage(checkCommand));
+        std::string installed = normalizeExtraVersion(statusValue(checkLines, "MC_MMS2_INSTALLED"));
+        std::string latest = normalizeExtraVersion(statusValue(checkLines, "MC_MMS2_LATEST"));
 
         if (latest.empty()) {
             checkFailed = true;
@@ -2377,6 +2410,81 @@ echo Zaparoo Frontend uninstalled.
     if (success) {
         sendSoftRebootCommand();
         waitForReconnectAfterReboot("ZAPAROO FRONTEND", "Soft reboot command sent. Waiting for MiSTer...");
+    }
+    refreshCurrentExtraStatus(false);
+}
+
+
+static std::string mms2GbCoreInstallShell() {
+    return R"SH(
+set -u
+TMP=/tmp/mc_mms2_gb_core
+rm -rf "$TMP"
+mkdir -p "$TMP" /media/fat/MMS2 /media/fat/config /media/fat/Scripts/.config/mms2_gb_core
+
+echo Finding latest MMS2 GB core...
+wget --no-check-certificate --header='User-Agent: MiSTer-Companion-NX' -O "$TMP/contents.json" "https://api.github.com/repos/Heber-co-uk/Gameboy_MiSTer_Cart/contents/releases?ref=master" || exit 1
+LATEST=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"Gameboy_\([0-9][0-9]*\)\.rbf".*/\1/p' "$TMP/contents.json" | sort | tail -1)
+if [ -z "$LATEST" ]; then echo Unable to find latest Gameboy_YYYYMMDD.rbf.; exit 1; fi
+RBF="Gameboy_${LATEST}.rbf"
+URL="https://raw.githubusercontent.com/Heber-co-uk/Gameboy_MiSTer_Cart/master/releases/$RBF"
+echo Latest core: $RBF
+
+echo Downloading MMS2 GB core...
+wget --no-check-certificate -O "$TMP/$RBF" "$URL" || exit 1
+if [ ! -s "$TMP/$RBF" ]; then echo Downloaded core is empty.; exit 1; fi
+
+echo Installing core to /media/fat/MMS2...
+cp "$TMP/$RBF" "/media/fat/MMS2/$RBF" || exit 1
+find /media/fat/MMS2 -maxdepth 1 -type f -name 'Gameboy_*.rbf' ! -name "$RBF" -delete
+
+echo Installing launcher shortcut...
+wget --no-check-certificate -O "/media/fat/Load GB-GBC Cartridge.mgl" "https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/assets/Load%20GB-GBC%20Cartridge.mgl" || exit 1
+
+echo Installing cartridge config...
+wget --no-check-certificate -O "/media/fat/config/MMS2_GB_Cart.CFG" "https://raw.githubusercontent.com/Anime0t4ku/mister-companion/main/assets/MMS2_GB_Cart.CFG" || exit 1
+
+printf '%s\n' "$LATEST" > /media/fat/Scripts/.config/mms2_gb_core/version.txt
+rm -rf "$TMP"
+sync
+echo MMS2 GB Core installed.
+echo A MiSTer menu reload is recommended.
+)SH";
+}
+
+void App::maybeSoftRebootAfterExtra(const char* title) {
+    if (!ssh.isConnected()) return;
+    if (!confirm(title, "RETURN TO MISTER MENU NOW?")) return;
+    sendSoftRebootCommand();
+    refreshNowPlaying();
+}
+
+void App::installOrUpdateMms2GbCore() {
+    const bool success = showStreamingCommandWindow("MMS2 GB CORE", mms2GbCoreInstallShell(), "MMS2 GB Core installed.", "MMS2 GB Core install failed.");
+    if (success) {
+        extraUpdateAvailable[static_cast<int>(ExtraId::Mms2GbCore)] = false;
+        maybeSoftRebootAfterExtra("MMS2 GB CORE");
+    }
+    refreshCurrentExtraStatus(false);
+}
+
+void App::uninstallMms2GbCore() {
+    if (!confirm("UNINSTALL MMS2 GB CORE", "REMOVE CORE, SHORTCUT AND CONFIG?")) return;
+    const std::string command = R"SH(
+echo Removing MMS2 GB Core files...
+rm -f /media/fat/MMS2/Gameboy_*.rbf
+rm -f "/media/fat/Load GB-GBC Cartridge.mgl"
+rm -f /media/fat/config/MMS2_GB_Cart.CFG
+rm -f /media/fat/Scripts/.config/mms2_gb_core/version.txt
+rmdir /media/fat/Scripts/.config/mms2_gb_core 2>/dev/null || true
+sync
+echo MMS2 GB Core uninstalled.
+echo The original Game Boy core and regular ROMs were not affected.
+)SH";
+    const bool success = showStreamingCommandWindow("UNINSTALL MMS2 GB CORE", command, "MMS2 GB Core uninstalled.", "MMS2 GB Core uninstall failed.");
+    extraUpdateAvailable[static_cast<int>(ExtraId::Mms2GbCore)] = false;
+    if (success) {
+        maybeSoftRebootAfterExtra("MMS2 GB CORE");
     }
     refreshCurrentExtraStatus(false);
 }
@@ -2645,6 +2753,13 @@ void App::executeExtraAction(ExtraId id, int actionIndex) {
         if (action == "INSTALL" || action == "UPDATE") installOrUpdateZaparooFrontend();
         else if (action == "CHECK FOR UPDATES") refreshCurrentExtraStatus(true);
         else if (action == "UNINSTALL") uninstallZaparooFrontend();
+        return;
+    }
+
+    if (id == ExtraId::Mms2GbCore) {
+        if (action == "INSTALL" || action == "UPDATE") installOrUpdateMms2GbCore();
+        else if (action == "CHECK FOR UPDATES") refreshCurrentExtraStatus(true);
+        else if (action == "UNINSTALL") uninstallMms2GbCore();
         return;
     }
 
