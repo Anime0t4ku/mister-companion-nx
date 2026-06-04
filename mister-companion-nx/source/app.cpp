@@ -2082,11 +2082,16 @@ static bool extraStatusInstalled(const std::vector<std::string>& lines) {
     return statusValue(lines, "INSTALLED") == "YES";
 }
 
+static bool extraStatusPartial(const std::vector<std::string>& lines) {
+    return statusValue(lines, "PARTIAL") == "YES";
+}
+
 std::vector<std::string> App::extraActions(ExtraId id) const {
     std::vector<std::string> statusLines = selectedExtra >= 0 && selectedExtra < static_cast<int>(cachedExtraStatus.size())
         ? cachedExtraStatus[selectedExtra]
         : std::vector<std::string>{};
     const bool installed = extraStatusInstalled(statusLines);
+    const bool partial = extraStatusPartial(statusLines);
     const bool updateAvailable = extraUpdateAvailable[static_cast<int>(id)];
 
     std::vector<std::string> actions;
@@ -2095,6 +2100,10 @@ std::vector<std::string> App::extraActions(ExtraId id) const {
     }
     if (!installed) {
         actions.push_back("INSTALL");
+        if (id == ExtraId::RetroAchievementCores && partial) {
+            actions.push_back("CONFIGURE");
+            actions.push_back("UNINSTALL");
+        }
         return actions;
     }
 
@@ -2111,7 +2120,7 @@ std::vector<std::string> App::extraStatus(ExtraId id) {
     if (!ssh.isConnected()) {
         if (id == ExtraId::ZaparooFrontend) return {"INSTALLED: NO", "VERSION: UNKNOWN"};
         if (id == ExtraId::Mms2GbCore) return {"INSTALLED: NO", "VERSION: UNKNOWN"};
-        return {"INSTALLED: NO"};
+        return {"INSTALLED: NO", "PARTIAL: NO"};
     }
 
     if (id == ExtraId::ZaparooFrontend) {
@@ -2135,10 +2144,34 @@ std::vector<std::string> App::extraStatus(ExtraId id) {
         return splitLines(runCommandMessage(command));
     }
 
-    const std::string command =
-        "INSTALLED=NO; "
-        "if [ -f /media/fat/MiSTer_RA ] && [ -f /media/fat/achievement.wav ] && [ -f /media/fat/retroachievements.cfg ] && [ -d /media/fat/_RA_Cores/Cores ] && [ -d /media/fat/_RA_Cores ] && grep -q '^main=MiSTer_RA' /media/fat/MiSTer.ini 2>/dev/null; then INSTALLED=YES; fi; "
-        "echo INSTALLED: $INSTALLED";
+    const std::string command = R"SH(
+INSTALLED=YES
+PARTIAL=NO
+ANY=NO
+check_file() {
+    if [ -f "$1" ]; then ANY=YES; else INSTALLED=NO; fi
+}
+check_dir() {
+    if [ -d "$1" ]; then ANY=YES; else INSTALLED=NO; fi
+}
+check_file /media/fat/MiSTer_RA
+check_file /media/fat/achievement.wav
+check_file /media/fat/retroachievements.cfg
+check_dir /media/fat/_RA_Cores
+check_dir /media/fat/_RA_Cores/Cores
+if grep -q '^main=MiSTer_RA' /media/fat/MiSTer.ini 2>/dev/null; then ANY=YES; else INSTALLED=NO; fi
+while IFS='|' read -r key title repo kind; do
+    [ -z "$key" ] && continue
+    [ "$key" = "main" ] && continue
+    check_file "/media/fat/_RA_Cores/Cores/$title.rbf"
+    check_file "/media/fat/_RA_Cores/$title.mgl"
+done <<'MCRASOURCES'
+)SH" + raSourcesHeredoc() + R"SH(MCRASOURCES
+if [ "$INSTALLED" = "NO" ] && [ "$ANY" = "YES" ]; then PARTIAL=YES; fi
+echo INSTALLED: $INSTALLED
+echo PARTIAL: $PARTIAL
+if [ "$PARTIAL" = "YES" ]; then echo STATUS: FILES MISSING; fi
+)SH";
     return splitLines(runCommandMessage(command));
 }
 
